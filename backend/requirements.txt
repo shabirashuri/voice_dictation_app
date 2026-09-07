@@ -1,0 +1,30 @@
+# FastAPI
+fastapi
+uvicorn[standard]
+
+# WebSocket
+websockets
+
+# Validation / settings
+pydantic
+pydantic-settings
+
+# LangGraph / LangChain
+langgraph
+langchain
+langchain-core
+
+# LLM
+langchain-openai
+
+# Speech-to-Text
+assemblyai
+
+# Supabase
+supabase
+
+# Environment
+python-dotenv
+
+# HTTP
+httpx
