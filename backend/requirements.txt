@@ -28,3 +28,7 @@ python-dotenv
 
 # HTTP
 httpx
+ 
+# Migrations
+alembic
+psycopg2-binary
