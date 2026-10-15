@@ -10,7 +10,7 @@ pydantic
 pydantic-settings
 
 # LangGraph / LangChain
-langgraph
+langgraph==1.2.11
 langchain
 langchain-core
 

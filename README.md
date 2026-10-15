@@ -84,7 +84,7 @@ create table reports (
 );
 ```
 
-The backend `app.db.supabase` module will read `SUPABASE_URL` and `SUPABASE_KEY` and provide `insert_report`, `fetch_report_by_id`, and `upsert_report` helpers.
+The backend connects to Postgres through `DATABASE_URL` (or `SUPABASE_DB_URL`) using the async SQLAlchemy engine in `backend/app/db/session.py`. Schema changes are managed with Alembic (`cd backend && alembic upgrade head`).
 
 Security & safety
 

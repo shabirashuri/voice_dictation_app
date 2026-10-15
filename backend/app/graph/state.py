@@ -24,7 +24,7 @@ class Report(BaseModel):
         target = update.target_section
         content = update.content.strip()
         if not content:
-            return
+            return False
 
         current = getattr(self, target, "") or ""
         if update.operation == "replace":
@@ -107,6 +107,20 @@ class LangGraphState(BaseModel):
     # most recent applied updates (for telemetry/UI diffs)
     updated_fields: List[FieldUpdate] = Field(default_factory=list)
     is_finished: bool = False
+    # set by the finish graph: dictation is over and the clinician must review
+    awaiting_review: bool = False
+
+    # Chunk-graph working fields (reset at the start of every chunk)
+    # bounded window of recent cleaned chunks passed to the LLM as context
+    recent_context: List[str] = Field(default_factory=list)
+    # raw, not-yet-validated LLM output for the current chunk
+    raw_updates: List[dict] = Field(default_factory=list)
+    raw_comment: Optional[dict] = None
+    validation_errors: List[str] = Field(default_factory=list)
+    retry_count: int = 0
+    # set when a chunk is rejected; the report is left unchanged
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
 
     def apply_updates(self, updates: List[FieldUpdate]) -> None:
         """Apply multiple updates to the single source-of-truth report.

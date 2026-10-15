@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import httpx
 
 from app.graph.state import ExtractionResponse
+from app.prompts.extraction import EXTRACTION_SYSTEM_PROMPT, REPAIR_NOTE_TEMPLATE
 from .base import LLMBase
 
 
@@ -38,24 +39,6 @@ EXTRACTION_FIELDS = (
     "comments",
 )
 
-EXTRACTION_SYSTEM_PROMPT = """You extract incremental pathology report updates from a doctor's current transcript chunk.
-
-The report has exactly these six fields: patient, specimen, gross_description,
-microscopic_description, diagnosis, comments.
-
-Rules:
-- Extract only information explicitly supported by the CURRENT TRANSCRIPT CHUNK.
-- Never invent, infer, summarize, or complete medical information.
-- Never generate a diagnosis during extraction.
-- Never generate an AI comment. A comments update is allowed only when the doctor explicitly dictates a comment, recommendation, or note.
-- Use the existing report and previous context to resolve continuations, but do not copy old information unless the current chunk continues it.
-- DETECTED FIELDS are hints, not absolute truth. Choose another valid field when the transcript clearly supports it.
-- A single chunk may update multiple fields.
-- Use append for normal continuation and replace only for an explicit correction such as 'actually' or 'I meant'.
-- Never replace unrelated fields.
-- Return {\"updates\": []} when the current chunk contains no relevant report information.
-- Return JSON only with the exact output schema provided by the user message.
-"""
 
 
 class DummyLLM(LLMBase):
@@ -212,14 +195,23 @@ class GroqLLM(LLMBase):
         detected = kwargs.get("detected_fields", []) or []
         previous_chunk = kwargs.get("previous_chunk", "") or ""
         active_field = kwargs.get("active_field") or "none"
+        recent_context = kwargs.get("recent_context") or []
+        validation_errors = kwargs.get("validation_errors") or []
         state_text = "\n".join(f"{field}: {report_state.get(field, '')}" for field in EXTRACTION_FIELDS)
+        recent_text = "\n".join(recent_context) or "[none]"
+        repair_note = (
+            REPAIR_NOTE_TEMPLATE.format(errors="\n".join(validation_errors)) + "\n"
+            if validation_errors
+            else ""
+        )
         user_content = f"""{prompt}
 
-CURRENT REPORT STATE:
+{repair_note}CURRENT REPORT STATE:
 {state_text}
 
 CURRENT/PREVIOUS CONTEXT:
 Previous chunk: {previous_chunk or '[none]'}
+Recent chunks: {recent_text}
 Active field: {active_field}
 
 CURRENT TRANSCRIPT CHUNK:
