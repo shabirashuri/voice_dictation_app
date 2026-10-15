@@ -442,6 +442,44 @@ h1 {
 .transcript-line.is-live {
   color: #e9f4cf;
 }
+.transcript-entry {
+  margin-bottom: 16px;
+}
+.transcript-entry .transcript-line {
+  margin-bottom: 4px;
+}
+.transcript-entry.is-pending .transcript-line {
+  color: #8c999c;
+}
+.transcript-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "DM Mono", monospace;
+  font-size: 10px;
+  color: #8c999c;
+}
+.transcript-status.is-applied {
+  color: #a6c86c;
+}
+.transcript-status.is-ignored {
+  color: #7c888b;
+}
+.transcript-status.is-failed {
+  color: #ffb1a6;
+}
+.retry-button {
+  border: 1px solid #6b3a33;
+  border-radius: 6px;
+  background: transparent;
+  color: #ffd0c8;
+  padding: 3px 9px;
+  font-family: "DM Mono", monospace;
+  font-size: 10px;
+}
+.retry-button:hover {
+  background: rgba(255, 141, 126, 0.12);
+}
 .transcript-footer {
   display: flex;
   align-items: center;

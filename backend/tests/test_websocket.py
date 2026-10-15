@@ -8,6 +8,7 @@ from assemblyai.streaming.v3 import RealTimeEvents
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from app.api.websocket import voice
 from app.services.llm.provider import LLMRateLimitError
 from app.services.streaming.manager import session_manager
 
@@ -19,8 +20,14 @@ class FakeLLM:
 
     def __init__(self):
         self.generate_called = 0
+        self.extract_calls = 0
+        self.failures = 0  # the next N extract calls raise a rate-limit error
 
     async def extract(self, prompt="", **kwargs):
+        self.extract_calls += 1
+        if self.failures > 0:
+            self.failures -= 1
+            raise LLMRateLimitError("quota exceeded")
         chunk = kwargs.get("chunk", "").lower()
         if "ratelimit" in chunk:
             raise LLMRateLimitError("quota exceeded")
@@ -66,6 +73,7 @@ def ws_client(app, monkeypatch):
     llm = FakeLLM()
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test")
     monkeypatch.setattr(voice, "AsyncRealTimeTranscriber", FakeTranscriber)
+    monkeypatch.setattr(voice, "RETRY_DELAYS", (0.0, 0.0, 0.0))  # no real backoff in tests
     monkeypatch.setattr("app.services.llm.provider.build_default_llm", lambda: llm)
     return TestClient(app), llm
 
@@ -142,8 +150,8 @@ def test_llm_rate_limit_reports_coded_error_and_keeps_session(ws_client):
         _auth(ws, token, case["id"])
         _next(ws, "begin")
         ws.send_text(_audio("ratelimit this chunk"))
-        err = _next(ws, "error")
-        assert err["code"] == "llm_rate_limit"
+        status = _next(ws, "chunk_status")
+        assert status["status"] == "failed" and status["code"] == "llm_rate_limit"
         # the session keeps working afterwards
         ws.send_text(_audio("Specimen is a gastric biopsy."))
         assert _next(ws, "state")["report"]["specimen"] == "Gastric biopsy"
@@ -162,7 +170,8 @@ def test_rejected_chunk_reports_validation_error_and_report_is_unchanged(ws_clie
         state = _next(ws, "state")
         assert state["updated_fields"] == []
         assert state["report"]["specimen"] == "Gastric biopsy"
-        assert _next(ws, "error")["code"] == "validation"
+        status = _next(ws, "chunk_status")
+        assert status["status"] == "failed" and status["code"] == "validation"
         ws.send_text(json.dumps({"type": "close"}))
 
 
@@ -339,3 +348,106 @@ def test_stop_does_not_hang_on_a_stuck_extraction(ws_client, monkeypatch):
     finally:
         gate.set()
         safety.cancel()
+
+
+class LowConfidenceTranscriber(FakeTranscriber):
+    async def stream(self, audio_bytes):
+        event = SimpleNamespace(
+            transcript=audio_bytes.decode(),
+            end_of_turn=True,
+            turn_order=1,
+            language_code="en",
+            words=[SimpleNamespace(confidence=0.2)],
+        )
+        await self.handlers[RealTimeEvents.Turn](self, event)
+
+
+def test_applied_turn_is_announced_with_its_id(ws_client):
+    client, _ = ws_client
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        turn = _next(ws, "turn")
+        assert turn["is_final"] is True and turn["turn_id"] == 1
+        _next(ws, "state")
+        status = _next(ws, "chunk_status")
+        assert status == {"type": "chunk_status", "turn_id": 1, "status": "applied"}
+        ws.send_text(json.dumps({"type": "close"}))
+
+
+def test_low_confidence_turn_is_shown_as_ignored_and_not_extracted(ws_client, monkeypatch):
+    client, llm = ws_client
+    monkeypatch.setattr(voice, "AsyncRealTimeTranscriber", LowConfidenceTranscriber)
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        turn = _next(ws, "turn")
+        assert turn["turn_id"] == 1
+        status = _next(ws, "chunk_status")
+        assert status == {"type": "chunk_status", "turn_id": 1, "status": "ignored", "code": "low_confidence"}
+        ws.send_text(json.dumps({"type": "close"}))
+    assert llm.extract_calls == 0
+
+
+def test_transient_llm_failure_is_retried_then_applied(ws_client):
+    client, llm = ws_client
+    llm.failures = 1
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        assert _next(ws, "state")["report"]["specimen"] == "Gastric biopsy"
+        assert _next(ws, "chunk_status")["status"] == "applied"
+        ws.send_text(json.dumps({"type": "close"}))
+    assert llm.extract_calls == 2
+
+
+def test_failed_chunk_can_be_retried_and_is_applied_once(ws_client):
+    client, llm = ws_client
+    llm.failures = 4  # the first try and all three retries fail
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        _next(ws, "turn")
+        failed = _next(ws, "chunk_status")
+        assert failed == {"type": "chunk_status", "turn_id": 1, "status": "failed", "code": "llm_rate_limit"}
+
+        ws.send_text(json.dumps({"type": "retry", "turn_id": 1}))
+        state = _next(ws, "state")
+        assert state["report"]["specimen"] == "Gastric biopsy"
+        assert _next(ws, "chunk_status") == {"type": "chunk_status", "turn_id": 1, "status": "applied"}
+
+        # Once applied it is no longer retryable.
+        ws.send_text(json.dumps({"type": "retry", "turn_id": 1}))
+        assert _next(ws, "chunk_status") == {
+            "type": "chunk_status", "turn_id": 1, "status": "ignored", "code": "unknown_turn",
+        }
+        ws.send_text(json.dumps({"type": "close"}))
+    assert llm.extract_calls == 5  # 4 failed attempts + 1 successful retry
+
+
+def test_retry_after_review_is_refused(ws_client):
+    client, llm = ws_client
+    llm.failures = 4
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        _next(ws, "turn")
+        _next(ws, "chunk_status")  # failed
+        ws.send_text(json.dumps({"type": "stop"}))
+        while not ws.receive_json().get("awaiting_review"):
+            pass
+        ws.send_text(json.dumps({"type": "retry", "turn_id": 1}))
+        assert _next(ws, "chunk_status") == {
+            "type": "chunk_status", "turn_id": 1, "status": "ignored", "code": "under_review",
+        }
+        ws.send_text(json.dumps({"type": "close"}))

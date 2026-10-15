@@ -96,7 +96,10 @@ All endpoints except `/auth/signup`, `/auth/login` and `/health` need `Authoriza
 **WebSocket messages**
 
 - Client → server: first `{"type": "auth", "token": "<access_token>", "case_id": 1}` (the server closes the socket with an `auth` error if the token is invalid, the case isn't yours, or it already has a report), then `{"audio": "<base64 PCM16 16 kHz>"}`, `{"type": "stop"}` (finish dictation), `{"type": "close"}` (end the session).
-- Server → client: `begin` (session id), `turn` (partial/final transcript), `state` (`report`, `updated_fields`, `is_finished`, `awaiting_review`), `termination`, and `error` with a `code`: `auth`, `stt`, `llm_rate_limit`, `validation`, `processing`, `finalize`, `timeout`, `internal`.
+- Client → server: `{"type": "retry", "turn_id": 4}` re-runs a failed final turn.
+- Server → client: `begin` (session id), `turn` (partial transcript; or a final turn with `turn_id`), `chunk_status` (`turn_id` plus `status`: `applied` | `nothing` | `failed` | `ignored`, and a `code` for failed/ignored turns), `state` (`report`, `updated_fields`, `is_finished`, `awaiting_review`), `termination`, and `error` for session-level problems with a `code`: `auth`, `stt`, `processing`, `finalize`, `timeout`, `internal`.
+
+Every final turn gets exactly one `chunk_status`, so nothing is dropped silently. Transient LLM failures (rate limit, timeout, provider error) are retried automatically with backoff (1s, 3s, 8s) before a turn is marked `failed`. A failed turn can be retried from the transcript; retries after the report is under review are refused (`ignored`, `under_review`).
 
 The case's patient name (and MRN) pre-fills the report's Patient field. After `stop` the socket stays open for review; saving goes over HTTP.
 

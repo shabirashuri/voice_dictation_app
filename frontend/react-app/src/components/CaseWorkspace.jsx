@@ -85,7 +85,7 @@ function DictationCase({ caseDetail, token, onReportSaved, onPhaseChange }) {
           aiCommentAcknowledged={session.aiCommentAcknowledged}
           onAcknowledgeAiComment={session.acknowledgeAiComment}
         />
-        <TranscriptPanel transcripts={session.transcripts} livePartial={session.livePartial} recording={session.recording} />
+        <TranscriptPanel transcripts={session.transcripts} livePartial={session.livePartial} recording={session.recording} onRetry={session.retryTurn} />
       </div>
     </>
   );

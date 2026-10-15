@@ -131,9 +131,23 @@ export function useVoiceSession({ caseId, token, onSaved } = {}) {
       if (data.type === "turn") {
         const text = data.transcript || "";
         if (data.is_final) {
-          if (text) setTranscripts((previous) => [...previous, text]);
+          if (text)
+            setTranscripts((previous) => [
+              ...previous,
+              { id: data.turn_id, text, status: "pending", code: null },
+            ]);
           setLivePartial("");
         } else if (text) setLivePartial(text);
+        return;
+      }
+      if (data.type === "chunk_status") {
+        setTranscripts((previous) =>
+          previous.map((line) =>
+            line.id === data.turn_id
+              ? { ...line, status: data.status, code: data.code ?? null }
+              : line,
+          ),
+        );
         return;
       }
       if (data.type === "termination") return;
@@ -243,6 +257,17 @@ export function useVoiceSession({ caseId, token, onSaved } = {}) {
     }
   }, [closeSocket, setPhase, stopAudio]);
 
+  // Ask the server to re-run a failed line. Its status goes back to pending
+  // until the server reports the new outcome.
+  const retryTurn = useCallback((turnId) => {
+    const socket = wsRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    setTranscripts((previous) =>
+      previous.map((line) => (line.id === turnId ? { ...line, status: "pending", code: null } : line)),
+    );
+    socket.send(JSON.stringify({ type: "retry", turn_id: turnId }));
+  }, []);
+
   const updateDraftField = useCallback(
     (key, value) => {
       if (phaseRef.current !== "review") return;
@@ -316,6 +341,7 @@ export function useVoiceSession({ caseId, token, onSaved } = {}) {
     savedReportId,
     highlighted,
     transcripts,
+    retryTurn,
     livePartial,
     updateDraftField,
     approveAndSave,

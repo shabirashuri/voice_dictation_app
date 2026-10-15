@@ -54,27 +54,30 @@ class Workflow:
         Returns a dict with keys: `report` (dict), `updated_fields` (list),
         `is_finished` (bool), and `error_code`/`error_message` when the chunk
         was rejected (the report is unchanged in that case). Chunks arriving
-        after finalize are ignored so they can't change a report under review.
+        after finalize are not applied and carry `skipped: "under_review"`.
         """
         async with session_manager.lock(session_id):
             state = _load_state(session_id)
+            skipped = None
             if not state.awaiting_review:
                 state.current_chunk = chunk
                 state.is_finished = False
                 state = await _run(chunk_graph, state, llm)
                 _save_state(session_id, state)
             else:
+                # Under review: the report is frozen, so the chunk is not applied.
                 state.updated_fields = []
                 state.error_code = None
+                skipped = "under_review"
 
-            return _with_error(
-                {
-                    "report": state.report.dict(),
-                    "updated_fields": [u.target_section for u in state.updated_fields],
-                    "is_finished": state.is_finished,
-                },
-                state,
-            )
+            result = {
+                "report": state.report.dict(),
+                "updated_fields": [u.target_section for u in state.updated_fields],
+                "is_finished": state.is_finished,
+            }
+            if skipped:
+                result["skipped"] = skipped
+            return _with_error(result, state)
 
     async def finalize(self, session_id: str, llm=None) -> dict:
         """Run the finish graph: final validation → comment decision → keep the

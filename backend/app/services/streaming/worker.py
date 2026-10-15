@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Turn:
     text: str
-    turn_order: Optional[int] = None
+    # Per-session id shown to the client; lets it link a line to its status.
+    turn_id: int = 0
 
 
 class ChunkWorker:

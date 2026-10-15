@@ -3,6 +3,7 @@ import os
 import json
 import base64
 import asyncio
+import itertools
 import logging
 import re
 import unicodedata
@@ -21,7 +22,7 @@ from app.db.session import get_session_factory
 from app.graph.routers import process_chunk, finalize
 from app.repositories.case import get_case
 from app.graph import workflow as _workflow_mod
-from app.services.llm.provider import LLMRateLimitError
+from app.services.llm.provider import LLMAPIError, LLMRateLimitError
 from app.services.streaming.worker import ChunkWorker, Turn
 
 router = APIRouter()
@@ -41,6 +42,13 @@ def _stop_drain_timeout_seconds() -> float:
         return float(os.environ.get("STOP_DRAIN_TIMEOUT_SECONDS", "30"))
     except ValueError:
         return 30.0
+
+
+# Waits before each retry of a transient LLM failure (rate limit, timeout, 5xx).
+# Three retries after the first attempt: four tries in total.
+RETRY_DELAYS = (1.0, 3.0, 8.0)
+# Texts of failed chunks kept per session so the clinician can retry them.
+MAX_FAILED_TURNS = 50
 
 
 # Scripts kept in transcripts: Latin (incl. accented letters) and Greek (used
@@ -75,19 +83,16 @@ def _english_only_text(text: str) -> str:
     return re.sub(r"\s+([,.!?;:])", r"\1", normalized)
 
 
-def _accepted_final_turn(event) -> bool:
-    """Reject explicitly non-English and low-confidence recognition results."""
-    transcript = getattr(event, "transcript", "") or ""
-    if not _english_only_text(transcript):
-        return False
-
+def _final_turn_ignore_reason(event) -> str | None:
+    """Why a final turn must not reach the report, or None if it may."""
     language_code = getattr(event, "language_code", None)
     if language_code and language_code.lower().split("-")[0] != "en":
-        return False
-
+        return "not_english"
     words = getattr(event, "words", None) or []
     confidences = [getattr(word, "confidence", 0.0) for word in words]
-    return not confidences or (sum(confidences) / len(confidences)) >= 0.55
+    if confidences and sum(confidences) / len(confidences) < 0.55:
+        return "low_confidence"
+    return None
 
 
 AUTH_TIMEOUT_SECONDS = 10
@@ -201,21 +206,49 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
     last_transcript = ""
     last_submitted_turn = None
     last_submitted_text = ""
+    turn_ids = itertools.count(1)
+    failed_turns: dict[int, str] = {}
     session_id: str | None = None
+
+    async def report_status(turn_id: int, status: str, code: str | None = None):
+        payload = {"type": "chunk_status", "turn_id": turn_id, "status": status}
+        if code:
+            payload["code"] = code
+        await safe_send(payload)
+
+    def remember_failed(turn_id: int, text: str):
+        failed_turns[turn_id] = text
+        while len(failed_turns) > MAX_FAILED_TURNS:
+            failed_turns.pop(next(iter(failed_turns)))
+
+    async def process_with_retries(sid: str, text: str) -> dict:
+        """Run one chunk. Transient LLM failures are retried with backoff; the
+        final attempt's error propagates. Failed attempts leave state unchanged,
+        so retrying the same text is safe."""
+        for delay in (*RETRY_DELAYS, None):
+            try:
+                return await process_chunk(sid, text)
+            except LLMAPIError as exc:
+                if delay is None:
+                    raise
+                logger.warning("transient LLM failure (%s); retrying in %.0fs", type(exc).__name__, delay)
+                await asyncio.sleep(delay)
 
     async def handle_turn(turn: Turn):
         """Runs on the worker: one final turn, processed in order."""
         sid = session_id or "default"
         try:
-            result = await process_chunk(sid, turn.text)
-        except Exception as e:
-            if isinstance(e, LLMRateLimitError):
-                logger.warning("LLM rate limit prevented transcript extraction: %s", e)
-                await safe_send({"type": "error", "code": "llm_rate_limit", "error": "LLM rate limited; please try again shortly"})
+            result = await process_with_retries(sid, turn.text)
+        except Exception as exc:
+            if isinstance(exc, LLMAPIError):
+                logger.warning("chunk %d not applied after retries: %s", turn.turn_id, type(exc).__name__)
             else:
-                logger.exception("langgraph process_chunk failed: %s", e)
-                await safe_send({"type": "error", "code": "processing", "error": "processing error"})
+                logger.exception("langgraph process_chunk failed")
+            remember_failed(turn.turn_id, turn.text)
+            code = "llm_rate_limit" if isinstance(exc, LLMRateLimitError) else "processing"
+            await report_status(turn.turn_id, "failed", code)
             return
+
         await safe_send({
             "type": "state",
             "session_id": sid,
@@ -223,65 +256,68 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
             "updated_fields": result.get("updated_fields"),
             "is_finished": result.get("is_finished"),
         })
-        if result.get("error_code"):
-            await safe_send({
-                "type": "error",
-                "code": result["error_code"],
-                "error": result.get("error_message") or "chunk rejected",
-            })
+        if result.get("skipped"):
+            await report_status(turn.turn_id, "ignored", result["skipped"])
+        elif result.get("error_code"):
+            remember_failed(turn.turn_id, turn.text)
+            await report_status(turn.turn_id, "failed", result["error_code"])
+        else:
+            await report_status(turn.turn_id, "applied" if result.get("updated_fields") else "nothing")
+
+    async def retry_turn(raw_turn_id, under_review: bool):
+        try:
+            turn_id = int(raw_turn_id)
+        except (TypeError, ValueError):
+            return
+        if under_review:
+            await report_status(turn_id, "ignored", "under_review")
+            return
+        text = failed_turns.pop(turn_id, None)
+        if text is None:
+            await report_status(turn_id, "ignored", "unknown_turn")
+            return
+        worker.submit(Turn(text=text, turn_id=turn_id))
 
     worker = ChunkWorker(handle_turn)
 
     async def on_turn(client, event):
         nonlocal last_transcript, last_submitted_turn, last_submitted_text
-        # event.transcript may be partial; send incremental updates instead
-        text = getattr(event, "transcript", "") or ""
         is_final = bool(getattr(event, "end_of_turn", False))
-
+        turn_order = getattr(event, "turn_order", None)
         # language_detection=False does not guarantee that the provider will
         # reject other scripts, so normalize those characters locally first.
-        text = _english_only_text(text)
+        text = _english_only_text(getattr(event, "transcript", "") or "")
 
-        # Do not display or process turns that AssemblyAI identifies as another
-        # language. For final turns, also reject likely noise hallucinations.
-        if is_final and (not text or not _accepted_final_turn(event)):
-            last_transcript = ""
-            return
         if not is_final:
+            # Partials are display-only: skip other languages and unchanged text.
             language_code = getattr(event, "language_code", None)
             if language_code and language_code.lower().split("-")[0] != "en":
                 return
-
-        # If nothing changed and not final, skip to avoid duplicates
-        if text == last_transcript and not is_final:
+            if text == last_transcript:
+                return
+            last_transcript = text
+            await safe_send({"type": "turn", "turn_order": turn_order, "transcript": text, "is_final": False})
             return
 
-        last_transcript = text
+        last_transcript = ""
+        if not text:
+            return
+        # AssemblyAI can send an identical final event twice; handle each turn once.
+        if text == last_submitted_text and (turn_order is None or turn_order == last_submitted_turn):
+            return
+        last_submitted_text = text
+        last_submitted_turn = turn_order
 
-        await safe_send({
-            "type": "turn",
-            "turn_order": getattr(event, "turn_order", None),
-            "transcript": text,
-            "is_final": is_final,
-        })
-
-        # Only complete turns are extracted. Partials are display-only; they may
-        # contain cumulative text that would otherwise be appended twice.
-        if is_final and text:
-            turn_order = getattr(event, "turn_order", None)
-            duplicate_final = (
-                text == last_submitted_text
-                and (turn_order is None or turn_order == last_submitted_turn)
-            )
-            if not duplicate_final:
-                last_submitted_text = text
-                last_submitted_turn = turn_order
-                # Returns at once; extraction happens on the worker, so this
-                # callback (and partial transcripts) is never held up by the LLM.
-                worker.submit(Turn(text=text, turn_order=turn_order))
-        # If this was a final turn, clear last_transcript so the next turn starts fresh
-        if is_final:
-            last_transcript = ""
+        turn_id = next(turn_ids)
+        await safe_send({"type": "turn", "turn_id": turn_id, "turn_order": turn_order, "transcript": text, "is_final": True})
+        # Every final turn gets a status: nothing is dropped silently.
+        reason = _final_turn_ignore_reason(event)
+        if reason:
+            await report_status(turn_id, "ignored", reason)
+            return
+        # Returns at once; extraction happens on the worker, so this callback
+        # (and partial transcripts) is never held up by the LLM.
+        worker.submit(Turn(text=text, turn_id=turn_id))
 
     async def on_termination(client, event):
         await safe_send({"type": "termination"})
@@ -374,6 +410,10 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
 
                 if data.get("type") == "close":
                     break
+
+                if data.get("type") == "retry":
+                    await retry_turn(data.get("turn_id"), under_review=reviewing)
+                    continue
 
                 # 'audio' field contains base64 encoded bytes; ignored once reviewing
                 audio_b64 = data.get("audio")
