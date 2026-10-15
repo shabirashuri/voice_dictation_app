@@ -24,8 +24,28 @@ except Exception:
     target_metadata = None
 
 
+# Load backend/.env so `alembic` works without exporting variables first.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+except ImportError:
+    pass
+
+
 def get_url():
-    return os.getenv("SUPABASE_DB_URL") or config.get_main_option("sqlalchemy.url")
+    """Same precedence as app/db/session.py: DATABASE_URL, then SUPABASE_DB_URL.
+
+    Alembic runs synchronously (psycopg2), so an async driver suffix is removed.
+    """
+    url = (
+        os.getenv("DATABASE_URL")
+        or os.getenv("SUPABASE_DB_URL")
+        or config.get_main_option("sqlalchemy.url")
+    )
+    if not url:
+        raise RuntimeError("Set DATABASE_URL (or SUPABASE_DB_URL) to run migrations")
+    return url.replace("postgresql+asyncpg://", "postgresql://", 1).replace("postgres://", "postgresql://", 1)
 
 
 def run_migrations_offline():
