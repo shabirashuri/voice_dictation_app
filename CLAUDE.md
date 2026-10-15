@@ -54,6 +54,7 @@ backend/app/
   prompts/                   extraction + repair note, comment prompt
   services/llm/provider.py   GroqLLM (OpenAI-compatible, httpx), DummyLLM, build_default_llm(), typed errors
   services/streaming/        StreamingManager: in-memory session state (deep copies), asyncio locks, TTL sweep
+  services/streaming/worker.py  ChunkWorker: per-session queue; final turns are extracted here, never inside the AssemblyAI callback
   db/session.py              async engine (asyncpg for Postgres, aiosqlite for SQLite), get_db, get_session_factory
   db/base.py                 shared declarative Base + Id type
   db/models/                 user.py (User), report.py (Case, Report; constraint names match the migrations)
@@ -108,7 +109,8 @@ npm run build
 ## Gotchas
 
 - A running `uvicorn --reload` reloads on every save mid-edit. Keep anything that touches the real DB out of import/startup paths.
-- Chunks that arrive after finalize are ignored (`awaiting_review`), so a late final turn can be dropped. Whether `transcriber.disconnect(terminate=True)` flushes the last turn before finalize is unverified against live AssemblyAI.
+- Stop order is `force_endpoint` → `disconnect(terminate=True)` → drain the worker (bounded by `STOP_DRAIN_TIMEOUT_SECONDS`) → finalize. `force_endpoint` sends a ForceEndpoint frame; that the server then returns the pending turn is unverified against live AssemblyAI.
+- Chunks that arrive after finalize are ignored (`awaiting_review`).
 - Session state lives in process memory: a server restart mid-dictation loses the draft, and it doesn't work across multiple workers.
 - Report IDs can have gaps (sequence numbers aren't reused). `case_number` is the human-facing identifier; the UI doesn't send it yet.
 - Approved reports can't be edited (no PUT): that needs audit/versioning, which is out of scope.

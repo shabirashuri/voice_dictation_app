@@ -71,6 +71,7 @@ See [backend/.env.example](backend/.env.example). Never commit `.env`.
 | `TURN_SILENCE_MS` | `7000` | Silence before AssemblyAI ends a turn. Raise it if sentences get split. |
 | `VAD_THRESHOLD` | `0.7` | Voice-activity threshold (0–1); higher rejects more background noise. |
 | `WS_IDLE_TIMEOUT_SECONDS` | `900` | Close a WebSocket with no client messages for this long. |
+| `STOP_DRAIN_TIMEOUT_SECONDS` | `30` | On Stop, how long to wait for queued dictation to finish before finalizing without the rest. |
 | `SESSION_TTL_SECONDS` | `3600` | Drop abandoned in-memory session state after this long. |
 
 ## API

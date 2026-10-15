@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 from types import SimpleNamespace
@@ -27,6 +28,8 @@ class FakeLLM:
             return BAD_UPDATE
         if "biopsy" in chunk:
             return {"updates": [{"target_section": "specimen", "operation": "append", "content": "Gastric biopsy"}]}
+        if "diagnosis" in chunk:
+            return {"updates": [{"target_section": "diagnosis", "operation": "append", "content": "Gastritis"}]}
         return {"updates": []}
 
     async def generate(self, prompt="", **kwargs):
@@ -219,3 +222,120 @@ def test_reported_case_cannot_be_dictated_again(ws_client):
     with client.websocket_connect("/ws/voice") as ws:
         _auth(ws, token, case["id"])
         _expect_auth_error(ws, "already has an approved report")
+
+
+class HoldingTranscriber(FakeTranscriber):
+    """Like AssemblyAI with no pause: audio yields only a partial turn, and the
+    final turn comes from force_endpoint() (what Stop triggers)."""
+
+    def __init__(self, api_key=None):
+        super().__init__(api_key)
+        self.pending = ""
+
+    async def stream(self, audio_bytes):
+        self.pending = audio_bytes.decode()
+        partial = SimpleNamespace(
+            transcript=self.pending, end_of_turn=False, turn_order=1, language_code="en", words=[]
+        )
+        await self.handlers[RealTimeEvents.Turn](self, partial)
+
+    async def force_endpoint(self):
+        if self.pending:
+            final = SimpleNamespace(
+                transcript=self.pending, end_of_turn=True, turn_order=1, language_code="en", words=[]
+            )
+            self.pending = ""
+            await self.handlers[RealTimeEvents.Turn](self, final)
+
+
+def test_partial_turns_keep_flowing_while_an_extraction_is_slow(ws_client, monkeypatch):
+    import threading
+
+    client, llm = ws_client
+    gate = threading.Event()
+    # Safety net: never let a regression hang the test run.
+    safety = threading.Timer(10, gate.set)
+    safety.start()
+    original = llm.extract
+
+    async def slow_first(prompt="", **kwargs):
+        if not getattr(slow_first, "done", False):
+            slow_first.done = True
+            await asyncio.to_thread(gate.wait, 10)
+        return await original(prompt=prompt, **kwargs)
+
+    llm.extract = slow_first
+    token, case, _ = _doctor_with_case(client)
+    try:
+        with client.websocket_connect("/ws/voice") as ws:
+            _auth(ws, token, case["id"])
+            _next(ws, "begin")
+            ws.send_text(_audio("Specimen is a gastric biopsy."))
+            ws.send_text(_audio("Diagnosis is gastritis."))
+            # Both turns are announced while the first extraction is still blocked.
+            first_two = [ws.receive_json()["type"], ws.receive_json()["type"]]
+            assert first_two == ["turn", "turn"]
+            assert not gate.is_set()
+            gate.set()
+            # Extraction then catches up, in order.
+            first_state = _next(ws, "state")
+            assert first_state["report"]["specimen"] == "Gastric biopsy"
+            second_state = _next(ws, "state")
+            assert second_state["report"]["diagnosis"] == "Gastritis"
+            ws.send_text(json.dumps({"type": "close"}))
+    finally:
+        gate.set()
+        safety.cancel()
+
+
+def test_last_sentence_without_a_pause_is_kept_at_stop(ws_client, monkeypatch):
+    client, llm = ws_client
+    monkeypatch.setattr("app.api.websocket.voice.AsyncRealTimeTranscriber", HoldingTranscriber)
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        ws.send_text(json.dumps({"type": "stop"}))
+        while True:
+            msg = ws.receive_json()
+            if msg.get("type") == "state" and msg.get("awaiting_review"):
+                break
+        assert msg["report"]["specimen"] == "Gastric biopsy"
+        ws.send_text(json.dumps({"type": "close"}))
+
+
+def test_stop_does_not_hang_on_a_stuck_extraction(ws_client, monkeypatch):
+    import threading
+
+    client, llm = ws_client
+    monkeypatch.setenv("STOP_DRAIN_TIMEOUT_SECONDS", "0.3")
+    gate = threading.Event()
+    safety = threading.Timer(10, gate.set)
+    safety.start()
+
+    async def stuck(prompt="", **kwargs):
+        await asyncio.to_thread(gate.wait, 10)
+        return {"updates": []}
+
+    llm.extract = stuck
+    token, case, _ = _doctor_with_case(client)
+    try:
+        with client.websocket_connect("/ws/voice") as ws:
+            _auth(ws, token, case["id"])
+            _next(ws, "begin")
+            ws.send_text(_audio("Specimen is a gastric biopsy."))
+            ws.send_text(json.dumps({"type": "stop"}))
+            errors, final = [], None
+            while final is None:
+                msg = ws.receive_json()
+                if msg.get("type") == "error":
+                    errors.append(msg["code"])
+                if msg.get("type") == "state" and msg.get("awaiting_review"):
+                    final = msg
+            assert errors == ["processing"]
+            assert final["is_finished"] is True
+            ws.send_text(json.dumps({"type": "close"}))
+    finally:
+        gate.set()
+        safety.cancel()
