@@ -22,7 +22,7 @@ from app.db.session import get_session_factory
 from app.graph.routers import process_chunk, finalize
 from app.repositories.case import get_case
 from app.graph import workflow as _workflow_mod
-from app.services.llm.provider import LLMAPIError, LLMRateLimitError
+from app.services.llm.provider import LLMAPIError, LLMRateLimitError, LLMTransientError
 from app.services.streaming.worker import ChunkWorker, Turn
 
 router = APIRouter()
@@ -44,7 +44,10 @@ def _stop_drain_timeout_seconds() -> float:
         return 30.0
 
 
-# Waits before each retry of a transient LLM failure (rate limit, timeout, 5xx).
+# Errors worth retrying: rate limits, timeouts, connection failures, 5xx.
+# A rejected request (e.g. bad API key) is not retried.
+TRANSIENT_LLM_ERRORS = (LLMRateLimitError, LLMTransientError)
+# Waits before each retry of a transient LLM failure.
 # Three retries after the first attempt: four tries in total.
 RETRY_DELAYS = (1.0, 3.0, 8.0)
 # Texts of failed chunks kept per session so the clinician can retry them.
@@ -228,7 +231,7 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
         for delay in (*RETRY_DELAYS, None):
             try:
                 return await process_chunk(sid, text)
-            except LLMAPIError as exc:
+            except TRANSIENT_LLM_ERRORS as exc:
                 if delay is None:
                     raise
                 logger.warning("transient LLM failure (%s); retrying in %.0fs", type(exc).__name__, delay)
@@ -241,7 +244,7 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
             result = await process_with_retries(sid, turn.text)
         except Exception as exc:
             if isinstance(exc, LLMAPIError):
-                logger.warning("chunk %d not applied after retries: %s", turn.turn_id, type(exc).__name__)
+                logger.warning("chunk %d not applied: %s", turn.turn_id, type(exc).__name__)
             else:
                 logger.exception("langgraph process_chunk failed")
             remember_failed(turn.turn_id, turn.text)

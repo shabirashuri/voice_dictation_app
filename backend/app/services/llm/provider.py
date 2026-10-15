@@ -26,6 +26,13 @@ class LLMRateLimitError(LLMAPIError):
     """The provider throttled the request or the account has exhausted quota."""
 
 
+class LLMTransientError(LLMAPIError):
+    """A failure that may succeed on retry: timeout, connection error, or 5xx.
+
+    Client errors (bad key, bad request) are plain LLMAPIError and are not retried.
+    """
+
+
 class LLMResponseError(LLMProviderError):
     """The provider returned content that was not valid extraction JSON."""
 
@@ -121,7 +128,7 @@ class GroqLLM(LLMBase):
                 return resp.json()
         except httpx.TimeoutException as exc:
             logger.exception("LLM request timed out")
-            raise LLMAPIError("LLM request timed out") from exc
+            raise LLMTransientError("LLM request timed out") from exc
         except httpx.HTTPStatusError as exc:
             detail = ""
             error_code = ""
@@ -142,12 +149,13 @@ class GroqLLM(LLMBase):
                 exc.response.status_code,
                 suffix,
             )
-            raise LLMAPIError(
+            error_type = LLMTransientError if exc.response.status_code >= 500 else LLMAPIError
+            raise error_type(
                 f"LLM request failed with HTTP status {exc.response.status_code}{suffix}"
             ) from exc
         except httpx.RequestError as exc:
             logger.exception("LLM request failed")
-            raise LLMAPIError("LLM request failed") from exc
+            raise LLMTransientError("LLM request failed") from exc
         except ValueError as exc:
             logger.exception("LLM returned invalid JSON at the HTTP response level")
             raise LLMResponseError("LLM returned invalid HTTP response JSON") from exc

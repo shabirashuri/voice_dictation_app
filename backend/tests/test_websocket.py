@@ -451,3 +451,48 @@ def test_retry_after_review_is_refused(ws_client):
             "type": "chunk_status", "turn_id": 1, "status": "ignored", "code": "under_review",
         }
         ws.send_text(json.dumps({"type": "close"}))
+
+
+def test_rejected_llm_request_is_not_retried(ws_client):
+    from app.services.llm.provider import LLMAPIError
+
+    client, llm = ws_client
+
+    async def bad_key(prompt="", **kwargs):
+        llm.extract_calls += 1
+        raise LLMAPIError("LLM request failed with HTTP status 401 (invalid_api_key)")
+
+    llm.extract = bad_key
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        status = _next(ws, "chunk_status")
+        assert status["status"] == "failed" and status["code"] == "processing"
+        ws.send_text(json.dumps({"type": "close"}))
+    assert llm.extract_calls == 1
+
+
+def test_server_error_is_retried(ws_client):
+    from app.services.llm.provider import LLMTransientError
+
+    client, llm = ws_client
+    calls = {"n": 0}
+
+    async def flaky_5xx(prompt="", **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise LLMTransientError("LLM request failed with HTTP status 503")
+        return {"updates": [{"target_section": "specimen", "operation": "append", "content": "Gastric biopsy"}]}
+
+    llm.extract = flaky_5xx
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        assert _next(ws, "chunk_status")["status"] == "applied"
+        ws.send_text(json.dumps({"type": "close"}))
+    assert calls["n"] == 2
+
