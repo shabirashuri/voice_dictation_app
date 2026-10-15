@@ -1,4 +1,4 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 import os
 import json
 import base64
@@ -16,23 +16,53 @@ from assemblyai.streaming.v3 import (
     NoiseSuppressionModel,
 )
 
+from app.core.security import AuthConfigError, decode_access_token
+from app.db.session import get_session_factory
 from app.graph.routers import process_chunk, finalize
+from app.repositories.case import get_case
 from app.graph import workflow as _workflow_mod
 from app.services.llm.provider import LLMRateLimitError
 
 router = APIRouter()
 
+# How long a connected client may stay silent (no audio, no messages) before
+# the socket is closed. Covers both live dictation and the review phase.
+def _idle_timeout_seconds() -> float:
+    try:
+        return float(os.environ.get("WS_IDLE_TIMEOUT_SECONDS", "900"))
+    except ValueError:
+        return 900.0
+
+
+# Scripts kept in transcripts: Latin (incl. accented letters) and Greek (used
+# for markers such as "α-SMA"). Everything else that is a letter or mark, e.g.
+# Arabic, Cyrillic, CJK or Devanagari, is noise for an English report.
+_KEPT_SCRIPT_PREFIXES = ("LATIN", "GREEK")
+# Symbols that look like letters but carry meaning in pathology text.
+_KEPT_SYMBOLS = {"\u00b5"}  # MICRO SIGN (µm)
+# Combining diacritics (U+0300–U+036F) attach to Latin letters, e.g. decomposed "é".
+_COMBINING_LATIN_RANGE = range(0x0300, 0x0370)
+
+
+def _keep_character(character: str) -> bool:
+    if ord(character) <= 127 or character in _KEPT_SYMBOLS:
+        return True
+    category = unicodedata.category(character)
+    if category[0] not in {"L", "M"}:
+        return True  # digits, punctuation, symbols such as × and °
+    if category[0] == "M":
+        return ord(character) in _COMBINING_LATIN_RANGE
+    try:
+        name = unicodedata.name(character)
+    except ValueError:
+        return False
+    return name.startswith(_KEPT_SCRIPT_PREFIXES)
+
 
 def _english_only_text(text: str) -> str:
-    """Remove letters from non-Latin scripts while preserving English text."""
-    filtered = []
-    for character in text:
-        character_type = unicodedata.category(character)
-        is_non_ascii_word_character = character_type[0] in {"L", "M"} and ord(character) > 127
-        if is_non_ascii_word_character:
-            continue
-        filtered.append(character)
-    normalized = " ".join("".join(filtered).split())
+    """Remove letters from non-Latin, non-Greek scripts; keep medical symbols and accents."""
+    filtered = "".join(character for character in text if _keep_character(character))
+    normalized = " ".join(filtered.split())
     return re.sub(r"\s+([,.!?;:])", r"\1", normalized)
 
 
@@ -51,14 +81,59 @@ def _accepted_final_turn(event) -> bool:
     return not confidences or (sum(confidences) / len(confidences)) >= 0.55
 
 
+AUTH_TIMEOUT_SECONDS = 10
+
+
+async def _authorize(ws: WebSocket, session_factory) -> tuple[str | None, str | None]:
+    """Wait for the client's first message, `{"type": "auth", "token", "case_id"}`.
+
+    Browsers can't set headers on a WebSocket; sending the token as a message
+    keeps it out of URLs and access logs. Returns (patient_text, error).
+    """
+    try:
+        data = json.loads(await asyncio.wait_for(ws.receive_text(), timeout=AUTH_TIMEOUT_SECONDS))
+    except (asyncio.TimeoutError, ValueError):
+        return None, "expected an auth message first"
+    if not isinstance(data, dict) or data.get("type") != "auth":
+        return None, "expected an auth message first"
+    try:
+        user_id = decode_access_token(str(data.get("token") or ""))
+    except AuthConfigError:
+        return None, "server authentication is not configured"
+    if user_id is None:
+        return None, "not signed in or session expired"
+    try:
+        case_id = int(data.get("case_id"))
+    except (TypeError, ValueError):
+        return None, "case_id is required"
+    # Short-lived session: no DB connection is held during dictation.
+    async with session_factory() as db:
+        case = await get_case(db, user_id, case_id)
+        if case is None:
+            return None, "case not found"
+        if case.report is not None:
+            return None, "this case already has an approved report"
+        patient = case.patient_name + (f" (MRN {case.patient_mrn})" if case.patient_mrn else "")
+    return patient, None
+
+
 @router.websocket("/ws/voice")
-async def websocket_voice(ws: WebSocket):
+async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_factory)):
     await ws.accept()
     logger = logging.getLogger("voice_ws")
 
+    try:
+        case_patient, auth_error = await _authorize(ws, session_factory)
+    except WebSocketDisconnect:
+        return
+    if auth_error:
+        await ws.send_text(json.dumps({"type": "error", "code": "auth", "error": auth_error}))
+        await ws.close(code=1008)
+        return
+
     api_key = os.environ.get("ASSEMBLYAI_API_KEY")
     if not api_key:
-        await ws.send_text(json.dumps({"error": "missing AssemblyAI API key"}))
+        await ws.send_text(json.dumps({"type": "error", "code": "stt", "error": "missing AssemblyAI API key"}))
         await ws.close()
         return
 
@@ -107,6 +182,9 @@ async def websocket_voice(ws: WebSocket):
         # Use AssemblyAI event.id as the session identifier for LangGraph
         nonlocal session_id
         session_id = getattr(event, "id", None)
+        # Start the case's report with its patient; dictation can add to it.
+        if session_id:
+            _workflow_mod.seed_patient(session_id, case_patient)
         await safe_send({"type": "begin", "id": session_id})
 
     # Keep UI transcript tracking separate from processed final turns. AssemblyAI
@@ -171,15 +249,21 @@ async def websocket_voice(ws: WebSocket):
                         "is_finished": result.get("is_finished"),
                     }
                     await safe_send(state_payload)
+                    if result.get("error_code"):
+                        await safe_send({
+                            "type": "error",
+                            "code": result["error_code"],
+                            "error": result.get("error_message") or "chunk rejected",
+                        })
                     last_processed_turn = turn_order
                     last_processed_text = text
                 except Exception as e:
                     if isinstance(e, LLMRateLimitError):
                         logger.warning("LLM rate limit prevented transcript extraction: %s", e)
-                        await safe_send({"type": "error", "error": "LLM rate limited; please try again shortly"})
+                        await safe_send({"type": "error", "code": "llm_rate_limit", "error": "LLM rate limited; please try again shortly"})
                     else:
                         logger.exception("langgraph process_chunk failed: %s", e)
-                        await safe_send({"type": "error", "error": "processing error"})
+                        await safe_send({"type": "error", "code": "processing", "error": "processing error"})
         except Exception:
             logger.exception("error while processing turn")
         # If this was a final turn, clear last_transcript so the next turn starts fresh
@@ -195,7 +279,7 @@ async def websocket_voice(ws: WebSocket):
             msg = event.message
         except Exception:
             msg = str(event)
-        await safe_send({"type": "error", "error": msg})
+        await safe_send({"type": "error", "code": "stt", "error": msg})
 
     # Register handlers
     transcriber.on(RealTimeEvents.Begin, on_begin)
@@ -206,10 +290,20 @@ async def websocket_voice(ws: WebSocket):
     try:
         await transcriber.connect(params)
 
-        # Read loop from client websocket -> stream to AssemblyAI
+        # Read loop from client websocket. While dictating, audio is streamed
+        # to AssemblyAI. After `stop`, the transcriber is closed but the socket
+        # stays open so the clinician can review the finalized report; the
+        # client ends the session with `close` (or by disconnecting).
+        reviewing = False
+        idle_timeout = _idle_timeout_seconds()
         try:
             while True:
-                msg = await ws.receive_text()
+                try:
+                    msg = await asyncio.wait_for(ws.receive_text(), timeout=idle_timeout)
+                except asyncio.TimeoutError:
+                    logger.info("closing idle websocket session %s", session_id)
+                    await safe_send({"type": "error", "code": "timeout", "error": "session closed after inactivity"})
+                    break
                 # Expecting JSON messages with base64 audio in `audio` field
                 try:
                     data = json.loads(msg)
@@ -217,9 +311,12 @@ async def websocket_voice(ws: WebSocket):
                     # ignore non-json messages
                     continue
 
-                # 'audio' field contains base64 encoded bytes
+                if data.get("type") == "close":
+                    break
+
+                # 'audio' field contains base64 encoded bytes; ignored once reviewing
                 audio_b64 = data.get("audio")
-                if audio_b64:
+                if audio_b64 and not reviewing:
                     try:
                         audio_bytes = base64.b64decode(audio_b64)
                     except Exception:
@@ -228,31 +325,46 @@ async def websocket_voice(ws: WebSocket):
                     # send binary chunk to AssemblyAI
                     await transcriber.stream(audio_bytes)
 
-                # handle explicit end/stop message from client
-                if data.get("type") == "stop":
-                    # Finalize session: generate AI comment only if needed, persist final state, and send it to client
+                if data.get("type") == "stop" and not reviewing:
+                    reviewing = True
+                    # Close STT first so in-flight turns can flush before
+                    # finalize. Turns that still arrive after finalize are
+                    # ignored by the workflow (the report is under review).
+                    try:
+                        await transcriber.disconnect(terminate=True)
+                    except Exception:
+                        logger.exception("failed to disconnect transcriber")
                     sid = session_id or "default"
                     try:
                         from app.services.llm.provider import build_default_llm
 
-                        llm = build_default_llm()
-
-                        final = await finalize(sid, llm=llm)
-                        await safe_send({"type": "state", "session_id": sid, "report": final.get("report"), "updated_fields": final.get("updated_fields", []), "is_finished": final.get("is_finished", True)})
+                        final = await finalize(sid, llm=build_default_llm())
+                        await safe_send({
+                            "type": "state",
+                            "session_id": sid,
+                            "report": final.get("report"),
+                            "updated_fields": [],
+                            "is_finished": final.get("is_finished", False),
+                            "awaiting_review": final.get("awaiting_review", False),
+                        })
+                        if final.get("error_code"):
+                            await safe_send({
+                                "type": "error",
+                                "code": final["error_code"],
+                                "error": final.get("error_message") or "finalize error",
+                            })
                     except Exception:
                         logger.exception("finalize failed for session %s", sid)
-                    # then disconnect the transcriber and end loop
-                    await transcriber.disconnect(terminate=True)
-                    break
+                        await safe_send({"type": "error", "code": "finalize", "error": "could not finalize the report"})
 
         except WebSocketDisconnect:
             # client disconnected
-            await transcriber.disconnect(terminate=True)
+            pass
 
     except Exception:
         logger.exception("websocket/assemblyai error")
         try:
-            await ws.send_text(json.dumps({"error": "internal server error"}))
+            await ws.send_text(json.dumps({"type": "error", "code": "internal", "error": "internal server error"}))
         except Exception:
             pass
     finally:
@@ -260,6 +372,9 @@ async def websocket_voice(ws: WebSocket):
             await transcriber.disconnect(terminate=True)
         except Exception:
             pass
+        # Live state is not kept after the session ends; the clinician-approved
+        # report is saved separately through the reports API.
+        _workflow_mod.discard_session(session_id or "default")
         try:
             await ws.close()
         except Exception:

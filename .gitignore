@@ -47,3 +47,6 @@ pnpm-debug.log*
 coverage/
 .cache/
 
+
+# Runtime graph session state (contains dictated content)
+backend/app/graph/sessions/

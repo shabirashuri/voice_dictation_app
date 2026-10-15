@@ -10,7 +10,7 @@ pydantic
 pydantic-settings
 
 # LangGraph / LangChain
-langgraph
+langgraph==1.2.11
 langchain
 langchain-core
 
@@ -23,6 +23,11 @@ assemblyai
 # Supabase
 supabase
 
+# Auth
+bcrypt
+PyJWT
+email-validator
+
 # Environment
 python-dotenv
 
@@ -32,3 +37,7 @@ httpx
 # Migrations
 alembic
 psycopg2-binary
+# Tests
+pytest
+pytest-asyncio
+aiosqlite

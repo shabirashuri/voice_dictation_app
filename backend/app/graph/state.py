@@ -1,5 +1,33 @@
+import logging
+import re
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, validator
+
+logger = logging.getLogger(__name__)
+
+# A replace that keeps less than this share of the field is suspicious, but
+# corrections legitimately shorten text, so it is only logged (never blocked).
+REPLACE_SHRINK_WARN_RATIO = 0.4
+
+
+def _normalize_sentence(text: str) -> str:
+    """Lower-case, collapse whitespace and drop trailing sentence punctuation."""
+    return " ".join(text.lower().split()).rstrip(".!?").strip()
+
+
+def _ends_with_sentence(field: str, content: str) -> bool:
+    """True when `content` is exactly the field's last sentence (or the whole field).
+
+    Compares whole sentences, not substrings: "negative" is not a repeat of
+    "Margins are negative", but "No H. pylori" is a repeat of "...No H. pylori".
+    """
+    norm_field = _normalize_sentence(field)
+    norm_content = _normalize_sentence(content)
+    if not norm_content:
+        return False
+    if norm_field == norm_content:
+        return True
+    return re.search(r"[.!?]\s+" + re.escape(norm_content) + r"$", norm_field) is not None
 
 
 # Core Report: single source of truth for the six required fields
@@ -24,16 +52,24 @@ class Report(BaseModel):
         target = update.target_section
         content = update.content.strip()
         if not content:
-            return
+            return False
 
         current = getattr(self, target, "") or ""
         if update.operation == "replace":
             if current == content:
                 return False
+            if current and len(content) < len(current) * REPLACE_SHRINK_WARN_RATIO:
+                # Logged by field and size only: report text is never logged.
+                logger.warning(
+                    "replace shrank %s from %d to %d characters",
+                    target,
+                    len(current),
+                    len(content),
+                )
             setattr(self, target, content)
         else:
             # append
-            if content == current or content in current:
+            if _ends_with_sentence(current, content):
                 return False
             if not current:
                 new_val = content
@@ -107,6 +143,20 @@ class LangGraphState(BaseModel):
     # most recent applied updates (for telemetry/UI diffs)
     updated_fields: List[FieldUpdate] = Field(default_factory=list)
     is_finished: bool = False
+    # set by the finish graph: dictation is over and the clinician must review
+    awaiting_review: bool = False
+
+    # Chunk-graph working fields (reset at the start of every chunk)
+    # bounded window of recent cleaned chunks passed to the LLM as context
+    recent_context: List[str] = Field(default_factory=list)
+    # raw, not-yet-validated LLM output for the current chunk
+    raw_updates: List[dict] = Field(default_factory=list)
+    raw_comment: Optional[dict] = None
+    validation_errors: List[str] = Field(default_factory=list)
+    retry_count: int = 0
+    # set when a chunk is rejected; the report is left unchanged
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
 
     def apply_updates(self, updates: List[FieldUpdate]) -> None:
         """Apply multiple updates to the single source-of-truth report.

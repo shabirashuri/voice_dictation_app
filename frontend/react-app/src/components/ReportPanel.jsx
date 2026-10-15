@@ -17,7 +17,26 @@ function isPopulated(value) {
   return Boolean(value && String(value).trim());
 }
 
-export function ReportPanel({ report, highlighted }) {
+function CommentSourceBadge({ source, acknowledged }) {
+  if (source === "ai")
+    return (
+      <span className={`source-badge is-ai ${acknowledged ? "is-reviewed" : ""}`}>
+        {acknowledged ? "AI-generated · reviewed" : "AI-generated · review required"}
+      </span>
+    );
+  if (source === "doctor") return <span className="source-badge">Clinician</span>;
+  return null;
+}
+
+export function ReportPanel({
+  report,
+  highlighted,
+  editable = false,
+  onFieldChange,
+  commentSource,
+  aiCommentAcknowledged,
+  onAcknowledgeAiComment,
+}) {
   const highlightedFields = new Set(
     (highlighted || []).map((field) =>
       typeof field === "string" ? field : field.target_section,
@@ -30,7 +49,9 @@ export function ReportPanel({ report, highlighted }) {
     <section className="report-panel panel" aria-labelledby="report-heading">
       <div className="panel-heading">
         <div>
-          <p className="section-kicker">Structured output</p>
+          <p className="section-kicker">
+            {editable ? "Clinician review" : "Structured output"}
+          </p>
           <h2 id="report-heading">Report fields</h2>
         </div>
         <span className="field-count">{completeCount}/6 complete</span>
@@ -39,27 +60,57 @@ export function ReportPanel({ report, highlighted }) {
         {REPORT_FIELDS.map(({ key, label, type, compact }) => {
           const populated = isPopulated(report[key]);
           const Field = type === "textarea" ? "textarea" : "input";
+          const isComments = key === "comments";
           return (
-            <label
-              className={`report-field ${compact ? "is-compact" : ""} ${highlightedFields.has(key) ? "is-updated" : ""}`}
+            <div
+              className={`report-field ${compact ? "is-compact" : ""} ${highlightedFields.has(key) ? "is-updated" : ""} ${editable ? "is-editable" : ""}`}
               key={key}
             >
-              <span className="field-label">
+              <label className="field-label" htmlFor={`field-${key}`}>
                 <span>{label}</span>
-                <span
-                  className={`field-state ${populated ? "is-complete" : ""}`}
-                >
-                  {populated ? "Complete" : "Pending"}
-                </span>
-              </span>
+                {isComments && populated ? (
+                  <CommentSourceBadge
+                    source={commentSource ?? report.comment_source}
+                    acknowledged={aiCommentAcknowledged}
+                  />
+                ) : (
+                  <span
+                    className={`field-state ${populated ? "is-complete" : ""}`}
+                  >
+                    {populated ? "Complete" : "Pending"}
+                  </span>
+                )}
+              </label>
               <Field
-                value={report[key] || ""}
-                readOnly
-                rows={compact ? 1 : type === "textarea" ? 4 : undefined}
+                id={`field-${key}`}
                 aria-label={label}
-                placeholder={`Waiting for ${label.toLowerCase()}...`}
+                value={report[key] || ""}
+                readOnly={!editable}
+                onChange={
+                  editable
+                    ? (event) => onFieldChange?.(key, event.target.value)
+                    : undefined
+                }
+                rows={compact ? 1 : type === "textarea" ? 4 : undefined}
+                placeholder={
+                  editable
+                    ? `Add ${label.toLowerCase()}...`
+                    : `Waiting for ${label.toLowerCase()}...`
+                }
               />
-            </label>
+              {isComments && editable && commentSource === "ai" && populated && (
+                <label className="ack-row">
+                  <input
+                    type="checkbox"
+                    checked={aiCommentAcknowledged}
+                    onChange={(event) =>
+                      onAcknowledgeAiComment?.(event.target.checked)
+                    }
+                  />
+                  <span>I have reviewed this AI-generated comment</span>
+                </label>
+              )}
+            </div>
           );
         })}
       </div>
