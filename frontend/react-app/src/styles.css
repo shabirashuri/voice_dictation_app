@@ -127,6 +127,11 @@ button {
   border-color: #ff8d7e;
   color: #291614;
 }
+.record-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
 .record-icon {
   font-size: 10px;
 }
@@ -282,6 +287,106 @@ h1 {
   border-color: #a6c86c;
   box-shadow: 0 0 0 3px rgba(166, 200, 108, 0.1);
 }
+.report-field.is-editable input,
+.report-field.is-editable textarea {
+  border-color: #46565a;
+  background: #1a2023;
+}
+.report-field.is-editable input:focus,
+.report-field.is-editable textarea:focus {
+  border-color: #d7f27c;
+  box-shadow: 0 0 0 3px rgba(215, 242, 124, 0.12);
+}
+.source-badge {
+  font-family: "DM Mono", monospace;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 3px 7px;
+  border-radius: 5px;
+  color: #a6c86c;
+  background: rgba(166, 200, 108, 0.1);
+}
+.source-badge.is-ai {
+  color: #ffc178;
+  background: rgba(255, 179, 92, 0.12);
+}
+.source-badge.is-ai.is-reviewed {
+  color: #c9b48f;
+  background: rgba(201, 180, 143, 0.1);
+}
+.ack-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+  color: #cbd2d2;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ack-row input {
+  accent-color: #d7f27c;
+  width: 15px;
+  height: 15px;
+}
+.review-bar,
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+  padding: 14px 18px;
+  border-radius: 10px;
+  border: 1px solid #3b4a2f;
+  background: rgba(166, 200, 108, 0.08);
+  font-size: 13px;
+}
+.review-bar > div:first-child,
+.error-banner > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.review-bar span,
+.error-banner span {
+  color: #aeb9bb;
+  font-size: 12px;
+}
+.review-bar.is-saved {
+  border-color: #4b6b33;
+}
+.error-banner {
+  border-color: #6b3a33;
+  background: rgba(255, 141, 126, 0.08);
+}
+.error-banner strong {
+  color: #ffb1a6;
+}
+.review-actions {
+  display: flex;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.review-button,
+.error-dismiss {
+  border: 1px solid #46565a;
+  border-radius: 8px;
+  background: transparent;
+  color: #e3e9e9;
+  padding: 9px 14px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.review-button.is-primary {
+  border-color: #d7f27c;
+  background: #d7f27c;
+  color: #172016;
+}
+.review-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .live-pill {
   display: flex;
   align-items: center;
@@ -403,6 +508,14 @@ h1 {
   }
   .transcript-panel {
     position: static;
+  }
+  .review-bar,
+  .error-banner {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .review-actions {
+    justify-content: flex-end;
   }
 }
 @media (max-width: 560px) {
