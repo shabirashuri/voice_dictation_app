@@ -251,7 +251,7 @@ OUTPUT SCHEMA:
     async def generate(self, prompt: str, **kwargs):
         system = {"role": "system", "content": "You are a helpful assistant."}
         user = {"role": "user", "content": prompt}
-        res = await self._chat_request([system, user], temperature=0.6, max_tokens=512)
+        res = await self._chat_request([system, user], temperature=0.2, max_tokens=512)
         try:
             choices = res.get("choices", [])
             if not choices:

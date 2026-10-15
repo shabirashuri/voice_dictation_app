@@ -1,6 +1,6 @@
 # Pathology Voice Reporting — MVP
 
-A clinical documentation assistant. A pathologist dictates naturally, in any order; the app streams speech to text, turns each transcript chunk into validated updates to a structured report, shows the report filling in live, and — after the clinician reviews, edits and approves it — saves it to Postgres (Supabase).
+A clinical documentation assistant. Doctors sign in and create a **case** for each patient; within a case the doctor dictates naturally, in any order; the app streams speech to text, turns each transcript chunk into validated updates to a structured report, shows the report filling in live, and — after the clinician reviews, edits and approves it — saves it to Postgres (Supabase).
 
 > **Assistive only.** The system structures what the clinician says. It does not diagnose. Any AI-generated comment is labelled as such and must be reviewed before the report can be approved.
 
@@ -16,7 +16,7 @@ Browser mic ──WS──> FastAPI /ws/voice ──> AssemblyAI streaming STT
 UI ◄── live report updates ───────────────────────────────────────────────────┘
 
 Stop ──> finish graph: final validation → keep clinician comment | generate one AI comment
-     ──> clinician reviews & edits in the UI ──> Approve ──> POST /reports ──> Postgres
+     ──> clinician reviews & edits in the UI ──> Approve ──> POST /cases/{id}/report ──> Postgres
 ```
 
 - **Sections are state, not steps.** Any chunk can update any field, several fields, or a field dictated earlier. The LLM returns only changes (`append` / `replace`), never a regenerated report.
@@ -47,7 +47,9 @@ npm install
 npm run dev                   # http://localhost:5173
 ```
 
-Click **Start session**, dictate, click **Stop session**, review and edit the fields, then **Approve & save**.
+Sign up (or sign in), click **+ New case** and enter the patient's name (MRN optional). With the case selected, click **Start session**, dictate, click **Stop session**, review and edit the fields, then **Approve & save**. The case is then marked *Reported* and its report is read-only.
+
+Each doctor sees only their own cases, and each case has exactly one report.
 
 The frontend talks to port 8000 on the page's host by default; override with `VITE_WS_URL` and `VITE_API_URL`.
 
@@ -62,6 +64,9 @@ See [backend/.env.example](backend/.env.example). Never commit `.env`.
 | `GROQ_API_BASE` / `GROQ_MODEL` | `https://api.groq.com/openai` / `openai/gpt-oss-20b` | LLM endpoint and model. |
 | `GROQ_MAX_RETRIES` | `0` | Rate-limit retries (kept at 0 for streaming latency). |
 | `DATABASE_URL` | — | Postgres connection string (Supabase). Falls back to `SUPABASE_DB_URL`. |
+| `JWT_SECRET` | — | Required. Signs login tokens; at least 32 random characters. |
+| `JWT_EXPIRE_MINUTES` | `720` | How long a login lasts. |
+| `BCRYPT_ROUNDS` | `12` | Password hashing cost. |
 | `DB_SSL` | `0` | Set to `1` to force SSL for the database connection. |
 | `TURN_SILENCE_MS` | `7000` | Silence before AssemblyAI ends a turn. Raise it if sentences get split. |
 | `VAD_THRESHOLD` | `0.7` | Voice-activity threshold (0–1); higher rejects more background noise. |
@@ -70,48 +75,45 @@ See [backend/.env.example](backend/.env.example). Never commit `.env`.
 
 ## API
 
+All endpoints except `/auth/signup`, `/auth/login` and `/health` need `Authorization: Bearer <access_token>`.
+
 | Method | Path | Description |
 |---|---|---|
-| `WS` | `/ws/voice` | Dictation session (protocol below). |
-| `POST` | `/reports` | Save an approved report. `201` with the report; `409` if that dictation session was already saved; `422` if invalid; `503` if the database is unreachable. |
-| `GET` | `/reports?limit=&offset=` | List reports, newest first. |
-| `GET` | `/reports/{id}` | One report. |
+| `POST` | `/auth/signup` | `{email, full_name, password}` (password ≥ 8 chars) → `201 {access_token, token_type, expires_in, user}`; `409` if the email exists. |
+| `POST` | `/auth/login` | `{email, password}` → `{access_token, ...}`; `401` on wrong email or password. |
+| `GET` | `/auth/me` | The signed-in doctor. |
+| `POST` | `/cases` | `{patient_name, patient_mrn?}` → `201` case with a generated `case_number` (`C-<year>-<id>`). |
+| `GET` | `/cases` | The doctor's cases, newest first, each with `status` `open` or `reported`. |
+| `GET` | `/cases/{id}` | One case with its `report` (or `null`). Other doctors' cases return `404`. |
+| `POST` | `/cases/{id}/report` | Save the approved report: `{session_id, report: {six fields}, comment_source}`. `409` if the case already has a report or the dictation was already saved; `422` if invalid; `503` if the database is unreachable. |
+| `GET` | `/cases/{id}/report` | The case's saved report. |
+| `WS` | `/ws/voice` | Dictation for one case (protocol below). |
 | `GET` | `/health` | Liveness check. |
 
-`POST /reports` body:
-
-```json
-{
-  "session_id": "assemblyai-session-id",
-  "case_number": "S26-0001",
-  "report": { "patient": "", "specimen": "", "gross_description": "", "microscopic_description": "", "diagnosis": "", "comments": "" },
-  "comment_source": "doctor"
-}
-```
-
-`comment_source` is required whenever `comments` is non-empty; an entirely empty report is rejected. `case_number` is optional (the UI does not send it yet).
+`comment_source` is required whenever `comments` is non-empty; an entirely empty report is rejected.
 
 **WebSocket messages**
 
-- Client → server: `{"audio": "<base64 PCM16 16 kHz>"}`, `{"type": "stop"}` (finish dictation), `{"type": "close"}` (end the session).
-- Server → client: `begin` (session id), `turn` (partial/final transcript), `state` (`report`, `updated_fields`, `is_finished`, `awaiting_review`), `termination`, and `error` with a `code`: `stt`, `llm_rate_limit`, `validation`, `processing`, `finalize`, `timeout`, `internal`.
+- Client → server: first `{"type": "auth", "token": "<access_token>", "case_id": 1}` (the server closes the socket with an `auth` error if the token is invalid, the case isn't yours, or it already has a report), then `{"audio": "<base64 PCM16 16 kHz>"}`, `{"type": "stop"}` (finish dictation), `{"type": "close"}` (end the session).
+- Server → client: `begin` (session id), `turn` (partial/final transcript), `state` (`report`, `updated_fields`, `is_finished`, `awaiting_review`), `termination`, and `error` with a `code`: `auth`, `stt`, `llm_rate_limit`, `validation`, `processing`, `finalize`, `timeout`, `internal`.
 
-After `stop` the socket stays open for review; saving goes over HTTP.
+The case's patient name (and MRN) pre-fills the report's Patient field. After `stop` the socket stays open for review; saving goes over HTTP.
 
 ## Database
 
 Postgres via async SQLAlchemy (`backend/app/db/session.py`); the schema is managed only by Alembic (`backend/alembic/versions/`). Tables:
 
-- `cases` — `case_number` (unique).
-- `reports` — the six fields, `comment_source`, `session_id` (unique: one report per dictation), `case_id`, `status` (`draft` | `approved`), `created_at`, `updated_at`, `approved_at`.
+- `users` — doctors: `email` (unique, lower-cased), `full_name`, bcrypt `password_hash`.
+- `cases` — `case_number` (unique, generated), `owner_id` → `users`, `patient_name`, `patient_mrn`.
+- `reports` — `case_id` (unique: one report per case), the six fields, `comment_source`, `session_id` (unique: one report per dictation), `status` (`draft` | `approved`), `created_at`, `updated_at`, `approved_at`.
 
-Report IDs may have gaps (Postgres does not reuse sequence numbers after a rollback). Use `case_number` for human-facing numbering.
+IDs and case numbers may have gaps (Postgres does not reuse sequence numbers after a rollback).
 
 ## Tests
 
 ```bash
-cd backend && python -m pytest tests          # graph, finish path, WebSocket, reports API (SQLite), LLM provider
-cd frontend/react-app && npm test             # review flow in the hook and App (Vitest + jsdom)
+cd backend && python -m pytest tests          # auth, cases API, graph, finish path, WebSocket (SQLite), LLM provider
+cd frontend/react-app && npm test             # sign-in, cases sidebar, review flow (Vitest + jsdom)
 ```
 
 Tests use fake LLMs, a fake AssemblyAI transcriber and an in-memory SQLite database — no external services are called.

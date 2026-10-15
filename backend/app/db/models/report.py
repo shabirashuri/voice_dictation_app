@@ -1,36 +1,45 @@
 from sqlalchemy import (
-    BigInteger,
     CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
-    Integer,
     String,
     Text,
     UniqueConstraint,
     func,
 )
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import relationship
 
-Base = declarative_base()
+from app.db.base import Base, Id
+from app.db.models.user import User  # noqa: F401  (registers the mapper)
 
-# BIGINT in Postgres; SQLite only autoincrements an INTEGER PRIMARY KEY.
-_Id = BigInteger().with_variant(Integer, "sqlite")
+__all__ = ["Base", "Case", "Report", "User"]
 
 
 class Case(Base):
+    """One patient specimen, owned by the doctor who created it.
+
+    `case_number` is generated (C-<year>-<id>). A case has at most one report.
+    """
+
     __tablename__ = "cases"
     __table_args__ = (UniqueConstraint("case_number", name="uq_cases_case_number"),)
 
-    id = Column(_Id, primary_key=True, autoincrement=True)
+    id = Column(Id, primary_key=True, autoincrement=True)
     case_number = Column(String(64), nullable=False)
+    owner_id = Column(
+        Id, ForeignKey("users.id", ondelete="RESTRICT", name="fk_cases_owner_id"), nullable=False, index=True
+    )
+    patient_name = Column(String(200), nullable=False)
+    patient_mrn = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
-    reports = relationship("Report", back_populates="case")
+    owner = relationship("User", back_populates="cases")
+    report = relationship("Report", back_populates="case", uselist=False)
 
 
 class Report(Base):
-    """A clinician-approved pathology report.
+    """A clinician-approved pathology report; exactly one per case.
 
     Only approved reports are stored; live dictation state never reaches the
     database. `comment_source` records whether the comment was dictated by
@@ -45,10 +54,11 @@ class Report(Base):
         ),
         CheckConstraint("status IN ('draft', 'approved')", name="ck_reports_status"),
         UniqueConstraint("session_id", name="uq_reports_session_id"),
+        UniqueConstraint("case_id", name="uq_reports_case_id"),
     )
 
-    id = Column(_Id, primary_key=True, autoincrement=True)
-    case_id = Column(_Id, ForeignKey("cases.id", ondelete="SET NULL", name="fk_reports_case_id"), nullable=True, index=True)
+    id = Column(Id, primary_key=True, autoincrement=True)
+    case_id = Column(Id, ForeignKey("cases.id", ondelete="RESTRICT", name="fk_reports_case_id"), nullable=False)
     # AssemblyAI session id; unique so the same dictation can't be saved twice
     session_id = Column(String(128), nullable=True)
 
@@ -67,4 +77,4 @@ class Report(Base):
     )
     approved_at = Column(DateTime(timezone=True), nullable=True)
 
-    case = relationship("Case", back_populates="reports")
+    case = relationship("Case", back_populates="report")

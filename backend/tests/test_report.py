@@ -77,3 +77,38 @@ def test_apply_updates_records_only_changed_fields():
     state = LangGraphState(report=Report(specimen="Gastric biopsy"))
     state.apply_updates([_u("specimen", "Gastric biopsy"), _u("diagnosis", "Gastritis")])
     assert [u.target_section for u in state.updated_fields] == ["diagnosis"]
+
+
+@pytest.mark.parametrize(
+    "current, added, applied",
+    [
+        # a new sentence that merely ends with an earlier word is kept
+        ("Margins are negative", "negative", True),
+        # an exact repeat of the last sentence is skipped
+        ("Chronic gastritis. No H. pylori", "No H. pylori", False),
+        ("Chronic gastritis. No H. pylori.", "no h. pylori", False),
+        # a sentence that appeared earlier, not last, is not a repeat
+        ("No H. pylori. Chronic gastritis", "No H. pylori", True),
+        # text that is only a prefix of the last sentence is not a repeat
+        ("Margins are negative", "Margins", True),
+    ],
+)
+def test_append_dedupes_whole_sentences_only(current, added, applied):
+    report = Report(microscopic_description=current)
+    assert report.apply_update(_u("microscopic_description", added)) is applied
+
+
+def test_large_replace_is_applied_and_logged_without_text(caplog):
+    report = Report(specimen="Gastric biopsy from the antrum. Two tan-white fragments measuring 0.3 cm")
+    with caplog.at_level("WARNING", logger="app.graph.state"):
+        assert report.apply_update(_u("specimen", "kidney biopsy", "replace")) is True
+    assert report.specimen == "kidney biopsy"
+    assert "replace shrank specimen" in caplog.text
+    assert "kidney biopsy" not in caplog.text  # no dictated text in logs
+
+
+def test_small_correction_is_not_logged(caplog):
+    report = Report(diagnosis="Chronic inactive gastritis with metaplasia")
+    with caplog.at_level("WARNING", logger="app.graph.state"):
+        report.apply_update(_u("diagnosis", "Chronic active gastritis with metaplasia", "replace"))
+    assert "shrank" not in caplog.text

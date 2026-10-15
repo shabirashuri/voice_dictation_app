@@ -73,3 +73,15 @@ export function lastSocket() {
 export function jsonResponse(status, body) {
   return { ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) };
 }
+
+// Route fetch calls by "METHOD /path" to canned responses (or functions of the request).
+export function routeFetch(routes) {
+  fetch.mockImplementation(async (url, options = {}) => {
+    const path = new URL(url).pathname;
+    const key = `${options.method || "GET"} ${path}`;
+    const route = routes[key];
+    if (!route) return jsonResponse(404, { detail: `no fake route for ${key}` });
+    const [status, body] = typeof route === "function" ? route(options) : route;
+    return jsonResponse(status, body);
+  });
+}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -35,10 +35,9 @@ class ReportFields(BaseModel):
 
 
 class ReportCreate(BaseModel):
-    """Body of POST /reports: the clinician-approved report."""
+    """Body of POST /cases/{case_id}/report: the clinician-approved report."""
 
     session_id: Optional[str] = Field(None, max_length=128)
-    case_number: Optional[str] = Field(None, max_length=64)
     report: ReportFields
     comment_source: Optional[Literal["doctor", "ai"]] = None
 
@@ -51,13 +50,12 @@ class ReportCreate(BaseModel):
             raise ValueError("comment_source is required when comments are present")
         if not self.report.comments:
             self.comment_source = None
-        if self.case_number is not None:
-            self.case_number = self.case_number.strip() or None
         return self
 
 
 class ReportOut(BaseModel):
     id: int
+    case_id: int
     case_number: Optional[str] = None
     session_id: Optional[str] = None
     patient: str = ""
@@ -76,6 +74,7 @@ class ReportOut(BaseModel):
     def from_row(cls, row) -> "ReportOut":
         return cls(
             id=row.id,
+            case_id=row.case_id,
             case_number=row.case.case_number if row.case else None,
             session_id=row.session_id,
             **{name: getattr(row, name) or "" for name in REPORT_FIELDS},
@@ -85,8 +84,3 @@ class ReportOut(BaseModel):
             updated_at=row.updated_at,
             approved_at=row.approved_at,
         )
-
-
-class ReportList(BaseModel):
-    reports: List[ReportOut]
-    total: int

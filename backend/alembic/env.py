@@ -18,7 +18,7 @@ fileConfig(config.config_file_name)
 # add your model's MetaData object here
 # for 'autogenerate' support
 try:
-    from app.db.models.report import Base as ReportBase
+    from app.db.models.report import Base as ReportBase  # also registers User
     target_metadata = ReportBase.metadata
 except Exception:
     target_metadata = None

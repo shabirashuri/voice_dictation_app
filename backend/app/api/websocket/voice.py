@@ -1,4 +1,4 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 import os
 import json
 import base64
@@ -16,7 +16,10 @@ from assemblyai.streaming.v3 import (
     NoiseSuppressionModel,
 )
 
+from app.core.security import AuthConfigError, decode_access_token
+from app.db.session import get_session_factory
 from app.graph.routers import process_chunk, finalize
+from app.repositories.case import get_case
 from app.graph import workflow as _workflow_mod
 from app.services.llm.provider import LLMRateLimitError
 
@@ -31,16 +34,35 @@ def _idle_timeout_seconds() -> float:
         return 900.0
 
 
+# Scripts kept in transcripts: Latin (incl. accented letters) and Greek (used
+# for markers such as "α-SMA"). Everything else that is a letter or mark, e.g.
+# Arabic, Cyrillic, CJK or Devanagari, is noise for an English report.
+_KEPT_SCRIPT_PREFIXES = ("LATIN", "GREEK")
+# Symbols that look like letters but carry meaning in pathology text.
+_KEPT_SYMBOLS = {"\u00b5"}  # MICRO SIGN (µm)
+# Combining diacritics (U+0300–U+036F) attach to Latin letters, e.g. decomposed "é".
+_COMBINING_LATIN_RANGE = range(0x0300, 0x0370)
+
+
+def _keep_character(character: str) -> bool:
+    if ord(character) <= 127 or character in _KEPT_SYMBOLS:
+        return True
+    category = unicodedata.category(character)
+    if category[0] not in {"L", "M"}:
+        return True  # digits, punctuation, symbols such as × and °
+    if category[0] == "M":
+        return ord(character) in _COMBINING_LATIN_RANGE
+    try:
+        name = unicodedata.name(character)
+    except ValueError:
+        return False
+    return name.startswith(_KEPT_SCRIPT_PREFIXES)
+
+
 def _english_only_text(text: str) -> str:
-    """Remove letters from non-Latin scripts while preserving English text."""
-    filtered = []
-    for character in text:
-        character_type = unicodedata.category(character)
-        is_non_ascii_word_character = character_type[0] in {"L", "M"} and ord(character) > 127
-        if is_non_ascii_word_character:
-            continue
-        filtered.append(character)
-    normalized = " ".join("".join(filtered).split())
+    """Remove letters from non-Latin, non-Greek scripts; keep medical symbols and accents."""
+    filtered = "".join(character for character in text if _keep_character(character))
+    normalized = " ".join(filtered.split())
     return re.sub(r"\s+([,.!?;:])", r"\1", normalized)
 
 
@@ -59,10 +81,55 @@ def _accepted_final_turn(event) -> bool:
     return not confidences or (sum(confidences) / len(confidences)) >= 0.55
 
 
+AUTH_TIMEOUT_SECONDS = 10
+
+
+async def _authorize(ws: WebSocket, session_factory) -> tuple[str | None, str | None]:
+    """Wait for the client's first message, `{"type": "auth", "token", "case_id"}`.
+
+    Browsers can't set headers on a WebSocket; sending the token as a message
+    keeps it out of URLs and access logs. Returns (patient_text, error).
+    """
+    try:
+        data = json.loads(await asyncio.wait_for(ws.receive_text(), timeout=AUTH_TIMEOUT_SECONDS))
+    except (asyncio.TimeoutError, ValueError):
+        return None, "expected an auth message first"
+    if not isinstance(data, dict) or data.get("type") != "auth":
+        return None, "expected an auth message first"
+    try:
+        user_id = decode_access_token(str(data.get("token") or ""))
+    except AuthConfigError:
+        return None, "server authentication is not configured"
+    if user_id is None:
+        return None, "not signed in or session expired"
+    try:
+        case_id = int(data.get("case_id"))
+    except (TypeError, ValueError):
+        return None, "case_id is required"
+    # Short-lived session: no DB connection is held during dictation.
+    async with session_factory() as db:
+        case = await get_case(db, user_id, case_id)
+        if case is None:
+            return None, "case not found"
+        if case.report is not None:
+            return None, "this case already has an approved report"
+        patient = case.patient_name + (f" (MRN {case.patient_mrn})" if case.patient_mrn else "")
+    return patient, None
+
+
 @router.websocket("/ws/voice")
-async def websocket_voice(ws: WebSocket):
+async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_factory)):
     await ws.accept()
     logger = logging.getLogger("voice_ws")
+
+    try:
+        case_patient, auth_error = await _authorize(ws, session_factory)
+    except WebSocketDisconnect:
+        return
+    if auth_error:
+        await ws.send_text(json.dumps({"type": "error", "code": "auth", "error": auth_error}))
+        await ws.close(code=1008)
+        return
 
     api_key = os.environ.get("ASSEMBLYAI_API_KEY")
     if not api_key:
@@ -115,6 +182,9 @@ async def websocket_voice(ws: WebSocket):
         # Use AssemblyAI event.id as the session identifier for LangGraph
         nonlocal session_id
         session_id = getattr(event, "id", None)
+        # Start the case's report with its patient; dictation can add to it.
+        if session_id:
+            _workflow_mod.seed_patient(session_id, case_patient)
         await safe_send({"type": "begin", "id": session_id})
 
     # Keep UI transcript tracking separate from processed final turns. AssemblyAI

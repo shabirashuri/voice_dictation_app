@@ -1,5 +1,33 @@
+import logging
+import re
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, validator
+
+logger = logging.getLogger(__name__)
+
+# A replace that keeps less than this share of the field is suspicious, but
+# corrections legitimately shorten text, so it is only logged (never blocked).
+REPLACE_SHRINK_WARN_RATIO = 0.4
+
+
+def _normalize_sentence(text: str) -> str:
+    """Lower-case, collapse whitespace and drop trailing sentence punctuation."""
+    return " ".join(text.lower().split()).rstrip(".!?").strip()
+
+
+def _ends_with_sentence(field: str, content: str) -> bool:
+    """True when `content` is exactly the field's last sentence (or the whole field).
+
+    Compares whole sentences, not substrings: "negative" is not a repeat of
+    "Margins are negative", but "No H. pylori" is a repeat of "...No H. pylori".
+    """
+    norm_field = _normalize_sentence(field)
+    norm_content = _normalize_sentence(content)
+    if not norm_content:
+        return False
+    if norm_field == norm_content:
+        return True
+    return re.search(r"[.!?]\s+" + re.escape(norm_content) + r"$", norm_field) is not None
 
 
 # Core Report: single source of truth for the six required fields
@@ -30,10 +58,18 @@ class Report(BaseModel):
         if update.operation == "replace":
             if current == content:
                 return False
+            if current and len(content) < len(current) * REPLACE_SHRINK_WARN_RATIO:
+                # Logged by field and size only: report text is never logged.
+                logger.warning(
+                    "replace shrank %s from %d to %d characters",
+                    target,
+                    len(current),
+                    len(content),
+                )
             setattr(self, target, content)
         else:
             # append
-            if content == current or content in current:
+            if _ends_with_sentence(current, content):
                 return False
             if not current:
                 new_val = content

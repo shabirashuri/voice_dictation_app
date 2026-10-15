@@ -23,6 +23,11 @@ assemblyai
 # Supabase
 supabase
 
+# Auth
+bcrypt
+PyJWT
+email-validator
+
 # Environment
 python-dotenv
 

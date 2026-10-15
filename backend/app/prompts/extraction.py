@@ -14,6 +14,7 @@ Rules:
 - DETECTED FIELDS are hints, not absolute truth. Choose another valid field when the transcript clearly supports it.
 - A single chunk may update multiple fields.
 - Use append for normal continuation and replace only for an explicit correction such as 'actually' or 'I meant'.
+- A replace must contain the COMPLETE corrected field value, including the parts that were not corrected. Never send only the corrected fragment.
 - Never replace unrelated fields.
 - Return {\"updates\": []} when the current chunk contains no relevant report information.
 - Return JSON only with the exact output schema provided by the user message.

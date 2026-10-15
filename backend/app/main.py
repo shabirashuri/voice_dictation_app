@@ -13,7 +13,8 @@ env_path = find_dotenv(filename=".env")
 if env_path:
     load_dotenv(env_path)
 
-from app.api.routes import reports as reports_routes
+from app.api.routes import auth as auth_routes
+from app.api.routes import cases as cases_routes
 from app.api.websocket import voice as voice_ws
 
 app = FastAPI()
@@ -28,7 +29,8 @@ app.add_middleware(
 )
 
 app.include_router(voice_ws.router)
-app.include_router(reports_routes.router)
+app.include_router(auth_routes.router)
+app.include_router(cases_routes.router)
 
 
 @app.get("/health")

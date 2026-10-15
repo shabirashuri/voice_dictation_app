@@ -70,3 +70,9 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 	async with AsyncSessionLocal() as session:
 		yield session
 
+
+
+def get_session_factory():
+	"""FastAPI dependency for code that opens its own short-lived sessions
+	(e.g. the voice WebSocket, which must not hold a connection while dictating)."""
+	return AsyncSessionLocal

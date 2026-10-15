@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { apiFetch, websocketUrl } from "../lib/api";
 import { encodeAudioChunk } from "../lib/audio";
 
 const EMPTY_REPORT = {
@@ -23,21 +24,13 @@ const STATUS_BY_PHASE = {
   saved: "Report saved",
 };
 
-function websocketUrl() {
-  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL;
-  return `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname || "localhost"}:8000/ws/voice`;
-}
-
-function apiBaseUrl() {
-  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL.replace(/\/$/, "");
-  return `${window.location.protocol}//${window.location.hostname || "localhost"}:8000`;
-}
-
 function pickReport(report) {
   return Object.fromEntries(REPORT_KEYS.map((key) => [key, report?.[key] || ""]));
 }
 
-export function useVoiceSession() {
+// Dictation for one case. The socket authenticates with `token` for `caseId`;
+// the approved report is saved to that case and `onSaved(report)` is called.
+export function useVoiceSession({ caseId, token, onSaved } = {}) {
   const [phase, setPhaseState] = useState("idle");
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState(null);
@@ -165,6 +158,8 @@ export function useVoiceSession() {
     socket.onopen = async () => {
       if (wsRef.current !== socket) return;
       setConnected(true);
+      // Must be the first message: the server checks the token and case.
+      socket.send(JSON.stringify({ type: "auth", token, case_id: caseId }));
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -173,6 +168,11 @@ export function useVoiceSession() {
             autoGainControl: false,
           },
         });
+        // The socket may have closed (e.g. auth rejected) while waiting for the mic.
+        if (wsRef.current !== socket) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         const context = new AudioContext();
         const source = context.createMediaStreamSource(stream);
@@ -219,14 +219,18 @@ export function useVoiceSession() {
       setConnected(false);
       const current = phaseRef.current;
       if (current === "connecting" || current === "recording") {
-        setError({ code: "connection", message: "Connection closed before the report was finalized." });
+        // Keep a more specific error (e.g. auth) if the server already sent one.
+        setError(
+          (previous) =>
+            previous ?? { code: "connection", message: "Connection closed before the report was finalized." },
+        );
         setPhase("idle");
       } else if (current === "finalizing") {
         // The draft can still be reviewed and saved over HTTP.
         enterReview(reportRef.current);
       }
     };
-  }, [closeSocket, enterReview, handleMessage, resetSessionView, setPhase, stopAudio]);
+  }, [caseId, closeSocket, enterReview, handleMessage, resetSessionView, setPhase, stopAudio, token]);
 
   const stopSession = useCallback(() => {
     stopAudio();
@@ -249,7 +253,7 @@ export function useVoiceSession() {
     [],
   );
 
-  // POST /reports {session_id, report, comment_source} -> {id, ...}
+  // POST /cases/{caseId}/report {session_id, report, comment_source} -> report
   const approveAndSave = useCallback(async () => {
     if (phaseRef.current !== "review") return;
     if (commentSource === "ai" && draft.comments.trim() && !aiCommentAcknowledged) {
@@ -259,35 +263,25 @@ export function useVoiceSession() {
     setError(null);
     setPhase("saving");
     try {
-      const response = await fetch(`${apiBaseUrl()}/reports`, {
+      const saved = await apiFetch(`/cases/${caseId}/report`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        token,
+        body: {
           session_id: sessionIdRef.current,
           report: draft,
           // A comment typed in review with no prior source is the clinician's.
           comment_source: draft.comments.trim() ? commentSource || "doctor" : null,
-        }),
+        },
       });
-      if (!response.ok) {
-        let detail = "";
-        try {
-          const body = await response.json();
-          detail = typeof body.detail === "string" ? body.detail : "";
-        } catch {
-          // non-JSON error body
-        }
-        throw new Error(detail || `Save failed (HTTP ${response.status})`);
-      }
-      const saved = await response.json().catch(() => ({}));
-      setSavedReportId(saved.id ?? null);
+      setSavedReportId(saved?.id ?? null);
       setPhase("saved");
       closeSocket();
+      onSaved?.(saved);
     } catch (saveError) {
       setError({ code: "save", message: saveError.message || "Could not save the report" });
       setPhase("review");
     }
-  }, [aiCommentAcknowledged, closeSocket, commentSource, draft, setPhase]);
+  }, [aiCommentAcknowledged, caseId, closeSocket, commentSource, draft, onSaved, setPhase, token]);
 
   const discardReport = useCallback(() => {
     closeSocket();

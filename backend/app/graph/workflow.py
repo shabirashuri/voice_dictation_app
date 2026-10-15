@@ -13,6 +13,14 @@ def _save_state(session_id: str, state: LangGraphState) -> None:
     session_manager.save(session_id, state)
 
 
+def seed_patient(session_id: str, patient: str) -> None:
+    """Pre-fill the Patient field from the case (only if still empty)."""
+    state = _load_state(session_id)
+    if patient and not state.report.patient:
+        state.report.patient = patient
+        _save_state(session_id, state)
+
+
 def discard_session(session_id: str) -> None:
     """Drop a session's in-memory state (on disconnect or after save)."""
     session_manager.discard(session_id)
