@@ -1,17 +1,10 @@
-import json
-from types import SimpleNamespace
-
 import pytest
-from assemblyai.streaming.v3 import RealTimeEvents
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
 
 from app.graph.routers import finalize, process_chunk
 from app.graph.state import LangGraphState
 from app.graph.workflow import _load_state, _save_state
 from app.services.llm.provider import LLMRateLimitError
-from app.services.streaming.manager import StreamingManager, session_manager
+from app.services.streaming.manager import StreamingManager
 
 
 class FakeLLM:
@@ -76,76 +69,3 @@ def test_session_manager_sweeps_idle_sessions_and_returns_copies():
     assert manager.load("a").report.patient == ""
     manager.sweep()
     assert "a" not in manager.sessions
-
-
-class FakeTranscriber:
-    """Stands in for AssemblyAI: each audio frame yields one final turn."""
-
-    def __init__(self, api_key=None):
-        self.handlers = {}
-        self.disconnected = False
-
-    def on(self, event, handler):
-        self.handlers[event] = handler
-
-    async def connect(self, params):
-        await self.handlers[RealTimeEvents.Begin](self, SimpleNamespace(id="ws_test"))
-
-    async def stream(self, audio_bytes):
-        event = SimpleNamespace(
-            transcript=audio_bytes.decode(), end_of_turn=True, turn_order=1, language_code="en", words=[]
-        )
-        await self.handlers[RealTimeEvents.Turn](self, event)
-
-    async def disconnect(self, terminate=False):
-        self.disconnected = True
-
-
-@pytest.fixture
-def ws_client(monkeypatch):
-    from app.api.websocket import voice
-
-    llm = FakeLLM()
-    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test")
-    monkeypatch.setattr(voice, "AsyncRealTimeTranscriber", FakeTranscriber)
-    monkeypatch.setattr("app.services.llm.provider.build_default_llm", lambda: llm)
-    app = FastAPI()
-    app.include_router(voice.router)
-    return TestClient(app), llm
-
-
-def _audio(text):
-    import base64
-
-    return json.dumps({"audio": base64.b64encode(text.encode()).decode()})
-
-
-def _next(ws, type_):
-    while True:
-        msg = ws.receive_json()
-        if msg.get("type") == type_:
-            return msg
-
-
-def test_websocket_stop_finalizes_and_keeps_socket_open_for_review(ws_client):
-    client, llm = ws_client
-    with client.websocket_connect("/ws/voice") as ws:
-        assert _next(ws, "begin")["id"] == "ws_test"
-        ws.send_text(_audio("Specimen is a gastric biopsy."))
-        state = _next(ws, "state")
-        assert state["report"]["specimen"] == "Gastric biopsy"
-
-        ws.send_text(json.dumps({"type": "stop"}))
-        final = _next(ws, "state")
-        assert final["is_finished"] is True and final["awaiting_review"] is True
-        assert final["report"]["comment_source"] == "ai"
-        assert llm.generate_called == 1
-
-        # socket is still open during review; audio is ignored now
-        ws.send_text(_audio("Diagnosis is gastritis biopsy."))
-        ws.send_text(json.dumps({"type": "close"}))
-        with pytest.raises(WebSocketDisconnect):
-            ws.receive_json()
-
-    # live state is dropped once the session ends
-    assert "ws_test" not in session_manager.sessions

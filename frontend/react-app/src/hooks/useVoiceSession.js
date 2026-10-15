@@ -252,6 +252,10 @@ export function useVoiceSession() {
   // POST /reports {session_id, report, comment_source} -> {id, ...}
   const approveAndSave = useCallback(async () => {
     if (phaseRef.current !== "review") return;
+    if (commentSource === "ai" && draft.comments.trim() && !aiCommentAcknowledged) {
+      setError({ code: "save", message: "Review the AI-generated comment before approving." });
+      return;
+    }
     setError(null);
     setPhase("saving");
     try {
@@ -283,7 +287,7 @@ export function useVoiceSession() {
       setError({ code: "save", message: saveError.message || "Could not save the report" });
       setPhase("review");
     }
-  }, [closeSocket, commentSource, draft, setPhase]);
+  }, [aiCommentAcknowledged, closeSocket, commentSource, draft, setPhase]);
 
   const discardReport = useCallback(() => {
     closeSocket();

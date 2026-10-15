@@ -102,3 +102,63 @@ async def test_recent_context_is_bounded_to_five_chunks():
     assert len(recent) == 5
     assert recent[-1] == "Chunk number 6."
     assert llm.calls[-1]["recent_context"][-1] == "Chunk number 5."
+
+
+class SectionLLM:
+    """Routes each chunk by keyword, like a well-behaved extractor."""
+
+    def __init__(self):
+        self.generate_called = 0
+
+    async def extract(self, prompt="", **kwargs):
+        chunk = kwargs["chunk"].lower()
+        updates = []
+        if "microscopically" in chunk:
+            updates.append({"target_section": "microscopic_description", "operation": "append", "content": "Chronic inactive gastritis."})
+        if "specimen" in chunk:
+            updates.append({"target_section": "specimen", "operation": "append", "content": "Gastric biopsy from the antrum."})
+        if "diagnosis" in chunk:
+            updates.append({"target_section": "diagnosis", "operation": "append", "content": "Chronic inactive gastritis."})
+        return {"updates": updates}
+
+    async def generate(self, prompt="", **kwargs):
+        self.generate_called += 1
+        return "AI-generated comment"
+
+
+@pytest.mark.asyncio
+async def test_sections_can_be_dictated_in_any_order():
+    _fresh("graph_order")
+    llm = SectionLLM()
+    r1 = await process_chunk("graph_order", "Microscopically, chronic inactive gastritis.", llm=llm)
+    assert r1["updated_fields"] == ["microscopic_description"]
+    assert r1["report"]["specimen"] == "" and r1["report"]["diagnosis"] == ""
+
+    r2 = await process_chunk("graph_order", "The final diagnosis is chronic inactive gastritis.", llm=llm)
+    assert r2["updated_fields"] == ["diagnosis"]
+
+    r3 = await process_chunk("graph_order", "The specimen is a gastric biopsy from the antrum.", llm=llm)
+    assert r3["updated_fields"] == ["specimen"]
+    assert r3["report"]["microscopic_description"] == "Chronic inactive gastritis."
+    assert r3["report"]["diagnosis"] == "Chronic inactive gastritis."
+
+
+@pytest.mark.asyncio
+async def test_one_chunk_can_update_multiple_sections():
+    _fresh("graph_multi")
+    res = await process_chunk(
+        "graph_multi",
+        "The specimen is a gastric biopsy from the antrum. Microscopically there is chronic inactive gastritis.",
+        llm=SectionLLM(),
+    )
+    assert res["updated_fields"] == ["microscopic_description", "specimen"]
+
+
+@pytest.mark.asyncio
+async def test_comments_are_never_generated_per_chunk():
+    _fresh("graph_no_comment")
+    llm = SectionLLM()
+    for chunk in ["Specimen is a biopsy.", "Microscopically, gastritis.", "Diagnosis is gastritis."]:
+        res = await process_chunk("graph_no_comment", chunk, llm=llm)
+        assert res["report"]["comments"] == ""
+    assert llm.generate_called == 0

@@ -83,6 +83,7 @@ export function ReportPanel({
               </label>
               <Field
                 id={`field-${key}`}
+                aria-label={label}
                 value={report[key] || ""}
                 readOnly={!editable}
                 onChange={
