@@ -2,105 +2,105 @@
 
 ## What this project is
 
-**Pathology Voice Reporting (MVP)**: a clinical documentation assistant. A pathologist dictates naturally, in any order. The app streams the audio to speech-to-text, extracts structured updates from each transcript chunk with an LLM, validates them, merges them into one cumulative report, and shows the report filling in live in the UI. The clinician reviews it before finalizing.
+**Pathology Voice Reporting (MVP)** — a clinical documentation assistant. A pathologist dictates naturally (any order); audio streams to speech-to-text, each transcript chunk is turned into validated structured updates by an LLM, merged into one cumulative report, and shown live. After Stop, the clinician reviews/edits/approves in the UI and the report is saved to Postgres (Supabase).
 
-It is **assistive only**. It structures what the clinician says and must never diagnose or invent clinical facts. See "Safety rules".
+It is **assistive only** — it structures what the clinician says; it must never diagnose or invent clinical facts. See "Safety rules".
 
-Design docs are the three PDFs in the repo root (`pathology_voice_reporting_*.pdf`). They are the source of truth for intent. `README.md` is partly out of date (see "Known gaps").
+Design docs: the three PDFs in the repo root (`pathology_voice_reporting_*.pdf`) are the source of truth for intent. `README.md` documents setup, config, API and the WebSocket protocol — don't duplicate it here.
 
 ## Architecture
 
 ```
-Browser mic --(base64 PCM16 16kHz over WS)--> FastAPI /ws/voice --> AssemblyAI streaming STT
-   ^                                                                        |
-   |                                                       final turn (end_of_turn)
-   |                                                                        v
-   +-- {"type":"state", report, updated_fields} <-- merge <-- extract (Groq LLM) <-- classify <-- clean
+Browser mic --(WS /ws/voice)--> FastAPI --> AssemblyAI streaming STT
+                                      | final turn
+                                      v
+chunk_graph:  clean -> classify -> extract (LLM) -> validate --ok--> merge -> state event
+                                        ^              | invalid
+                                        +-- repair <---+ (MAX_REPAIR_ATTEMPTS=1) then reject -> error{code:validation}
+stop -> finish_graph: final_validate -> keep_comment | generate_comment (once) -> mark_review (awaiting_review)
+     -> UI review/edit/approve -> POST /reports -> Postgres
 ```
 
 Core principle: `State(n+1) = Graph(State(n), TranscriptChunk(n))`.
 
-- **Report sections are state, not sequential graph nodes.** Never force Patient → Specimen → Gross → Micro → Diagnosis order. A chunk can touch any section, several sections, or revisit an earlier one.
-- The LLM returns **only deltas**, never a whole regenerated report: `{"updates":[{"target_section","operation":"append|replace","content"}]}`.
-- `active_field` is a **hint, not a rule**. The LLM may override it.
-- LLM output is **untrusted** until Pydantic validates it. Only validated updates are merged and sent to the UI. Never stream raw LLM tokens into clinical fields.
-- Report fields: `patient`, `specimen`, `gross_description`, `microscopic_description`, `diagnosis`, `comments` (all plain strings), plus `comment_source` (`"doctor"` | `"ai"` | None).
+- **Report sections are state, not sequential graph nodes.** Never force section order. A chunk can touch any/many sections.
+- LLM returns **deltas only**: `{"updates":[{"target_section","operation":"append|replace","content"}]}`.
+- `active_field` and `detected_fields` are **hints**, never routing rules.
+- LLM output is **untrusted** until `validate_update` passes. Only validated updates merge; never stream raw LLM tokens into fields.
+- Fields: `patient`, `specimen`, `gross_description`, `microscopic_description`, `diagnosis`, `comments` (plain strings, by decision) + `comment_source` (`doctor` | `ai` | None).
 
 ### Comment rule (important)
 
-- If the doctor dictates a comment, keep it and mark it `doctor`.
-- If not, generate **one** AI comment **only at finalize** (on the client's `{"type":"stop"}`), from the final validated report. Mark it `ai`; the clinician must review it.
-- Never generate comments per chunk. The comment prompt may use only the report fields and must not add findings.
+- Dictated comment → kept, `comment_source="doctor"`.
+- None → **one** AI comment generated **only in the finish graph** (on `{"type":"stop"}`), `comment_source="ai"`. Re-finalizing must not generate another. Never per chunk.
+- An AI comment must be acknowledged (checkbox or edit) before approve — enforced in `useVoiceSession.approveAndSave` *and* the UI. Editing it keeps it labelled `ai`.
 
 ## Layout
 
 ```
 backend/app/
-  main.py                    FastAPI app, CORS (*), /health, startup DB create_all
-  core/config.py             pydantic-settings Settings (db_url, supabase_*, stt_provider)
-  api/websocket/voice.py     /ws/voice: AssemblyAI v3 streaming, turn handling, English-only/confidence filters, stop -> finalize
-  api/routes/reports.py      stub (GET /reports/ returns [])  -- note: not included in main.py
-  graph/state.py             Report, FieldUpdate, ExtractionResponse, ExtractedChunk, LangGraphState (Pydantic)
-  graph/workflow.py          Workflow.process_chunk / finalize; per-session JSON persistence + asyncio locks
-  graph/routers.py           thin module-level process_chunk()/finalize() wrappers used by the WS handler
-  graph/nodes/               clean -> classify (keyword hints) -> extract (LLM) -> merge; finalize.py is stale
-  graph/sessions/*.json      per-session state files written at runtime (see gotchas)
-  services/llm/provider.py   LLMBase, GroqLLM (OpenAI-compatible chat API via httpx), DummyLLM, build_default_llm()
-  services/stt|streaming/    mostly stubs
-  db/session.py, db/models/  async SQLAlchemy engine/models; alembic/ has migration 0001 (reports table)
-  schemas/                   small Pydantic schemas (events, report, voice)
-backend/tests/               pytest (test_workflow.py, test_llm_provider.py)
-frontend/react-app/          Vite + React 18 (plain JS/JSX, no TS, no router, no state lib)
-  src/hooks/useVoiceSession.js   WS client, mic capture, message handling (begin/turn/state/termination/error)
-  src/lib/audio.js               PCM16 capture/encode
-  src/components/                Header, RecordButton, TranscriptPanel, ReportPanel
+  main.py                    FastAPI app: CORS(*), /health, voice WS router, reports router. No create_all.
+  api/websocket/voice.py     /ws/voice: AssemblyAI v3, English/confidence filters, stop->finalize, review phase, idle timeout, coded errors, discards session on close
+  api/routes/reports.py      POST/GET /reports, GET /reports/{id}
+  graph/graph.py             builds + compiles chunk_graph and finish_graph (no `from __future__ import annotations` here)
+  graph/validation_router.py routing fns, MAX_REPAIR_ATTEMPTS, RECENT_CONTEXT_SIZE
+  graph/nodes/               clean, classify, extract (raw output), validate_update, repair/reject, merge, finalize_report, generate_comment
+  graph/state.py             Report, FieldUpdate, ExtractionResponse, LangGraphState (incl. graph working fields)
+  graph/workflow.py          Workflow.process_chunk / finalize over the graphs; per-session lock
+  graph/routers.py           module-level process_chunk()/finalize() used by the WS handler and tests
+  prompts/                   extraction + repair note, comment prompt
+  services/llm/provider.py   GroqLLM (OpenAI-compatible, httpx), DummyLLM, build_default_llm(), typed errors
+  services/streaming/        StreamingManager: in-memory session state (deep copies), asyncio locks, TTL sweep
+  db/session.py              async engine (asyncpg for Postgres, aiosqlite for SQLite), get_db dependency
+  db/models/report.py        Case, Report ORM models (constraint names match the migrations)
+  repositories/report.py     create_approved_report (DuplicateSessionError), get_report, list_reports
+  schemas/report.py          ReportCreate / ReportOut / ReportList (API contract, validation)
+backend/alembic/versions/    0001 reports table, 0002 cases + report fields (DB is at 0002)
+backend/tests/               pytest suites (see Commands)
+frontend/react-app/src/
+  hooks/useVoiceSession.js   session phases, WS client, draft/review state, save, errors
+  components/                Header, RecordButton, ReportPanel, TranscriptPanel, ReviewBar, ErrorBanner
+  test/fakes.js              FakeWebSocket, AudioContext/getUserMedia/fetch stubs for Vitest
 ```
 
-### WebSocket protocol
-
-- Client → server: `{"audio": "<base64 pcm16>"}` frames, then `{"type":"stop"}` to finalize.
-- Server → client: `begin` (carries the AssemblyAI session id, which is also the graph session id), `turn` (partial/final transcript), `state` (`report`, `updated_fields`, `is_finished`), `termination`, `error`.
-- Only **final** turns (`end_of_turn`) go through the graph. Partials are display-only. Duplicate final turns are skipped.
+Frontend phases: `idle → connecting → recording → finalizing → review → saving → saved`. Fields are read-only except in `review`.
 
 ## Commands
 
 ```bash
-# Backend (venv lives at backend/venv)
-cd backend && source venv/bin/activate && pip install -r requirements.txt
-python -m uvicorn app.main:app --reload          # http://localhost:8000, WS ws://localhost:8000/ws/voice
-python -m pytest tests                           # run from backend/
+cd backend && source venv/bin/activate
+python -m uvicorn app.main:app --reload       # :8000
+python -m pytest tests                        # 55 tests, no external calls
+alembic upgrade head                          # reads backend/.env (DATABASE_URL)
+alembic upgrade <from>:head --sql             # review migration SQL before applying
 
-# Frontend
-cd frontend/react-app && npm install && npm run dev   # http://localhost:5173
+cd frontend/react-app
+npm run dev                                   # :5173
+npm test                                      # Vitest, 18 tests
 npm run build
 ```
 
-The frontend hard-codes the WS URL as `ws(s)://<hostname>:8000/ws/voice` (`useVoiceSession.js`).
-
-### Environment (`.env`, never commit)
-
-`ASSEMBLYAI_API_KEY` (required), `GROQ_API_KEY` (without it `build_default_llm()` falls back to `DummyLLM`), `GROQ_API_BASE`, `GROQ_MODEL` (default `openai/gpt-oss-20b`), `GROQ_MAX_RETRIES` (default 0, for streaming latency), `TURN_SILENCE_MS` (default 7000), `VAD_THRESHOLD` (default 0.7), `DATABASE_URL` / `SUPABASE_URL` / `SUPABASE_KEY` / `SUPABASE_DB_URL`, `DB_SSL`.
-
 ## Conventions
 
-- Python 3, async throughout (FastAPI, httpx, asyncio). Pydantic models are the contract; the code uses the v1-style API (`.dict()`, `.json()`, `parse_raw`, `@validator`), so match that or migrate deliberately.
-- Keep it simple. Out of scope for the MVP: Docker, Redis/Celery/Kafka, microservices, RAG/vector DB, auth/multitenancy, audit/versioning, OS-wide dictation.
-- LLM provider errors are typed (`LLMProviderError` > `LLMAPIError` > `LLMRateLimitError`, plus `LLMResponseError`). The WS handler turns rate limits into a friendly `error` event. Don't swallow API failures silently.
-- Tests inject fake LLMs and monkeypatch `workflow._SESSIONS_DIR` / httpx. Follow that pattern and don't call real APIs in tests.
-- `.editorconfig` is mostly cpp_* settings and irrelevant to this codebase.
+- Python async throughout. `state.py` models still use the Pydantic v1-style API (`.dict()`, `@validator`); `schemas/report.py` uses v2. Match the file you're in.
+- LangGraph nodes take the state model and return **only the fields they own** (wrappers in `graph.py` run helpers on a deep copy). Don't mutate the incoming state.
+- Schema changes go through a new Alembic migration; never `create_all` against the real DB. Name constraints explicitly and keep model and migration names identical.
+- Errors sent to the client always carry a `code`; the UI maps codes to titles in `ErrorBanner.jsx`.
+- Tests inject fake LLMs / a fake transcriber (`monkeypatch` `build_default_llm`, `voice.AsyncRealTimeTranscriber`) and use SQLite via `dependency_overrides[get_db]`. Never call real AssemblyAI/Groq/Supabase from tests.
+- Keep it simple. Out of scope: Docker, Redis/Celery/Kafka, microservices, RAG, auth/multitenancy, audit/versioning, OS-wide dictation.
+- `.editorconfig` is unrelated cpp settings and is not tracked.
 
 ## Safety rules (healthcare)
 
-- Preserve the doctor's wording in extracted content. Don't paraphrase clinical findings, and don't infer facts that weren't spoken.
-- AI-generated text must be labeled `comment_source="ai"` and never presented as clinician-authored.
-- The clinician reviews and edits before finalizing. Don't add autonomous diagnosis or decision-making.
+- Preserve the doctor's wording; never infer facts that weren't spoken.
+- AI text is always `comment_source="ai"`, never presented as clinician-authored, and must be reviewed before approval.
+- A report is stored only after explicit clinician approval. No autonomous diagnosis.
 
-## Known gaps and gotchas
+## Gotchas
 
-- **Session state is stored as JSON files** in `backend/app/graph/sessions/` (one per AssemblyAI session id), not in memory or the DB. Many are committed to git, including test fixtures. Runtime-generated ones show up as untracked; don't commit them. They may contain patient dictation, so consider gitignoring them.
-- `graph/nodes/finalize.py` is stale. It imports a nonexistent `ReportState`, and the real finalize logic is `Workflow.finalize`.
-- Persistence is unfinished. `repositories/report.py` references `SessionLocal` (session.py exports `AsyncSessionLocal`), `api/routes/reports.py` is a stub and isn't mounted, and README mentions an `app.db.supabase` module that doesn't exist. The PDF plan calls for Supabase save-on-finish plus a clinician review/edit/approve step, which is not fully built.
-- The architecture PDFs describe LangGraph nodes and a Pydantic validate → repair/retry loop. The current code runs the nodes sequentially in plain Python (`workflow.py`) without a LangGraph graph or a repair loop. Validation happens when `FieldUpdate` objects are constructed. `langgraph` is in requirements but unused.
-- The first PDF mentions MySQL; later docs and code use Supabase/Postgres. Postgres is the current direction.
-- `Report.apply_update` returns `None` instead of `False` for empty content (works, but inconsistent). Append skips content already contained in the field.
-- CORS is `*`, which is fine for dev only.
+- A running `uvicorn --reload` reloads on every save mid-edit. Keep anything that touches the real DB out of import/startup paths.
+- Chunks that arrive after finalize are ignored (`awaiting_review`), so a late final turn can be dropped. Whether `transcriber.disconnect(terminate=True)` flushes the last turn before finalize is unverified against live AssemblyAI.
+- Session state lives in process memory: a server restart mid-dictation loses the draft, and it doesn't work across multiple workers.
+- Report IDs can have gaps (sequence numbers aren't reused). `case_number` is the human-facing identifier; the UI doesn't send it yet.
+- There's no `PUT /reports/{id}`: editing an approved report needs audit/versioning, which is out of scope.
+- `npm audit` flags dev-only tooling (vite 5.0.0's esbuild, vitest internals). Fixing it needs major version upgrades.
