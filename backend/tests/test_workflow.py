@@ -289,14 +289,14 @@ async def test_active_field_and_duplicate_chunk_are_persisted_and_deduplicated()
     assert first["updated_fields"] == ["microscopic_description"]
 
     # The mocked provider recognizes the continuation and returns the field update.
-    second = await process_chunk(session_id, "and mild foveolar hyperplasia.", llm=llm)
+    second = await process_chunk(session_id, "and mild foveolar hyperplasia. No intestinal metaplasia or malignancy is identified.", llm=llm)
     assert second["updated_fields"] == ["microscopic_description"]
     persisted = _load_state(session_id)
     assert persisted.active_field == "microscopic_description"
-    assert persisted.previous_chunk == "and mild foveolar hyperplasia."
+    assert persisted.previous_chunk == "and mild foveolar hyperplasia. No intestinal metaplasia or malignancy is identified."
 
     call_count = len(llm.calls)
-    duplicate = await process_chunk(session_id, "and mild foveolar hyperplasia.", llm=llm)
+    duplicate = await process_chunk(session_id, "and mild foveolar hyperplasia. No intestinal metaplasia or malignancy is identified.", llm=llm)
     assert duplicate["updated_fields"] == []
     assert len(llm.calls) == call_count
     assert duplicate["report"] == second["report"]

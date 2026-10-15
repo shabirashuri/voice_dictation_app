@@ -162,3 +162,34 @@ async def test_comments_are_never_generated_per_chunk():
         res = await process_chunk("graph_no_comment", chunk, llm=llm)
         assert res["report"]["comments"] == ""
     assert llm.generate_called == 0
+
+
+@pytest.mark.asyncio
+async def test_invented_measurement_is_repaired_then_rejected_and_report_unchanged():
+    _fresh("graph_ground_number")
+    bad = {"updates": [{"target_section": "gross_description", "operation": "append", "content": "Tumour measures 2.5 cm."}]}
+    llm = ScriptedLLM(bad, bad)
+    res = await process_chunk("graph_ground_number", "Tumour is present in the sample.", llm=llm)
+    assert res["error_code"] == "validation"
+    assert res["report"]["gross_description"] == ""
+    assert len(llm.calls) == 2  # one repair attempt, then reject
+    assert "validation_errors" in llm.calls[1]
+
+
+@pytest.mark.asyncio
+async def test_dropped_negation_is_repaired_when_the_model_keeps_only_part_of_it():
+    _fresh("graph_ground_negation")
+    partial = {"updates": [{"target_section": "microscopic_description", "operation": "append", "content": "Margins are 2 mm"}]}
+    llm = ScriptedLLM(partial, partial)
+    res = await process_chunk("graph_ground_negation", "No atypia. Margins are 2 mm.", llm=llm)
+    assert res["error_code"] == "validation"
+    assert res["report"]["microscopic_description"] == ""
+
+
+@pytest.mark.asyncio
+async def test_chit_chat_containing_no_is_not_rejected():
+    _fresh("graph_ground_chitchat")
+    llm = ScriptedLLM({"updates": []})
+    res = await process_chunk("graph_ground_chitchat", "No, that's all for now.", llm=llm)
+    assert "error_code" not in res
+    assert len(llm.calls) == 1

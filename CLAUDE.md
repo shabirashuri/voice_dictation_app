@@ -49,6 +49,7 @@ backend/app/
   graph/validation_router.py routing fns, MAX_REPAIR_ATTEMPTS, RECENT_CONTEXT_SIZE
   graph/nodes/               clean, classify, extract (raw output), validate_update, repair/reject, merge, finalize_report, generate_comment
   graph/state.py             Report, FieldUpdate, ExtractionResponse, LangGraphState (incl. graph working fields)
+  graph/grounding.py         check_grounding / check_dropped_negation: numbers, units, laterality, negations must be in the dictation (narrow, deliberate); used by validate_update and the AI comment
   graph/workflow.py          Workflow.process_chunk / finalize over the graphs; per-session lock
   graph/routers.py           module-level process_chunk()/finalize() used by the WS handler and tests
   prompts/                   extraction + repair note, comment prompt

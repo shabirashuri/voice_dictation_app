@@ -21,6 +21,7 @@ Stop ──> finish graph: final validation → keep clinician comment | generat
 
 - **Sections are state, not steps.** Any chunk can update any field, several fields, or a field dictated earlier. The LLM returns only changes (`append` / `replace`), never a regenerated report.
 - **Nothing unvalidated reaches the report.** LLM output is checked with Pydantic; an invalid response gets one repair attempt, then the chunk is rejected and the UI is told.
+- **Output must match the dictation.** Each update's numbers, units, laterality and negations must appear in what was said (`backend/app/graph/grounding.py`); an unsupported update gets the same repair-then-reject treatment. The AI comment may only restate the report; an unsupported comment is withheld for the clinician to write.
 - **Comments:** a dictated comment is kept as the clinician's. If there is none, one AI comment is generated at Stop — never per chunk — and must be reviewed before approving.
 - **Live state stays in memory.** Nothing is written to disk during dictation; only the approved report is stored.
 

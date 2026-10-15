@@ -69,3 +69,24 @@ def test_session_manager_sweeps_idle_sessions_and_returns_copies():
     assert manager.load("a").report.patient == ""
     manager.sweep()
     assert "a" not in manager.sessions
+
+
+@pytest.mark.asyncio
+async def test_ai_comment_with_an_unsupported_statement_is_withheld():
+    _save_state("finish_withheld", LangGraphState())
+    llm = FakeLLM(comment="No additional pathology identified.")
+    await process_chunk("finish_withheld", "Specimen is a gastric biopsy.", llm=llm)
+    res = await finalize("finish_withheld", llm=llm)
+    assert res["report"]["comments"] == ""
+    assert res["report"]["comment_source"] is None
+    assert res["is_finished"] is True and res["awaiting_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_grounded_ai_comment_is_kept():
+    _save_state("finish_grounded", LangGraphState())
+    llm = FakeLLM(comment="Gastric biopsy received.")
+    await process_chunk("finish_grounded", "Specimen is a gastric biopsy.", llm=llm)
+    res = await finalize("finish_grounded", llm=llm)
+    assert res["report"]["comments"] == "Gastric biopsy received."
+    assert res["report"]["comment_source"] == "ai"
