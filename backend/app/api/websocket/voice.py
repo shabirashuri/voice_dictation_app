@@ -3,6 +3,7 @@ import os
 import json
 import base64
 import asyncio
+import itertools
 import logging
 import re
 import unicodedata
@@ -19,9 +20,11 @@ from assemblyai.streaming.v3 import (
 from app.core.security import AuthConfigError, decode_access_token
 from app.db.session import get_session_factory
 from app.graph.routers import process_chunk, finalize
+from app.prompts.pathology_terms import PATHOLOGY_TERMS
 from app.repositories.case import get_case
 from app.graph import workflow as _workflow_mod
-from app.services.llm.provider import LLMRateLimitError
+from app.services.llm.provider import LLMAPIError, LLMRateLimitError, LLMTransientError
+from app.services.streaming.worker import ChunkWorker, Turn
 
 router = APIRouter()
 
@@ -32,6 +35,27 @@ def _idle_timeout_seconds() -> float:
         return float(os.environ.get("WS_IDLE_TIMEOUT_SECONDS", "900"))
     except ValueError:
         return 900.0
+
+
+def _stop_drain_timeout_seconds() -> float:
+    """How long Stop waits for in-flight chunks before finalizing without them."""
+    try:
+        return float(os.environ.get("STOP_DRAIN_TIMEOUT_SECONDS", "30"))
+    except ValueError:
+        return 30.0
+
+
+# Errors worth retrying: rate limits, timeouts, connection failures, 5xx.
+# A rejected request (e.g. bad API key) is not retried.
+TRANSIENT_LLM_ERRORS = (LLMRateLimitError, LLMTransientError)
+# Waits before each retry of a transient LLM failure.
+# Three retries after the first attempt: four tries in total.
+RETRY_DELAYS = (1.0, 3.0, 8.0)
+# Silence before a turn ends. Long enough to keep a sentence with a mid-sentence
+# pause together, short enough that the report updates while the doctor talks.
+DEFAULT_TURN_SILENCE_MS = 3000
+# Texts of failed chunks kept per session so the clinician can retry them.
+MAX_FAILED_TURNS = 50
 
 
 # Scripts kept in transcripts: Latin (incl. accented letters) and Greek (used
@@ -66,19 +90,16 @@ def _english_only_text(text: str) -> str:
     return re.sub(r"\s+([,.!?;:])", r"\1", normalized)
 
 
-def _accepted_final_turn(event) -> bool:
-    """Reject explicitly non-English and low-confidence recognition results."""
-    transcript = getattr(event, "transcript", "") or ""
-    if not _english_only_text(transcript):
-        return False
-
+def _final_turn_ignore_reason(event) -> str | None:
+    """Why a final turn must not reach the report, or None if it may."""
     language_code = getattr(event, "language_code", None)
     if language_code and language_code.lower().split("-")[0] != "en":
-        return False
-
+        return "not_english"
     words = getattr(event, "words", None) or []
     confidences = [getattr(word, "confidence", 0.0) for word in words]
-    return not confidences or (sum(confidences) / len(confidences)) >= 0.55
+    if confidences and sum(confidences) / len(confidences) < 0.55:
+        return "low_confidence"
+    return None
 
 
 AUTH_TIMEOUT_SECONDS = 10
@@ -140,9 +161,9 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
     # Configure real-time parameters: PCM 16-bit, 16k sample rate, use universal model
     # Allow configurable turn silence via TURN_SILENCE_MS env var (milliseconds).
     try:
-        turn_silence_ms = int(os.environ.get("TURN_SILENCE_MS", "7000"))
+        turn_silence_ms = int(os.environ.get("TURN_SILENCE_MS", str(DEFAULT_TURN_SILENCE_MS)))
     except Exception:
-        turn_silence_ms = 7000
+        turn_silence_ms = DEFAULT_TURN_SILENCE_MS
     try:
         vad_threshold = float(os.environ.get("VAD_THRESHOLD", "0.7"))
     except Exception:
@@ -159,6 +180,7 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
         min_turn_silence=turn_silence_ms,
         vad_threshold=vad_threshold,
         voice_focus=NoiseSuppressionModel.near_field,
+        keyterms_prompt=PATHOLOGY_TERMS,
     )
 
     transcriber = AsyncRealTimeTranscriber(api_key=api_key)
@@ -187,88 +209,123 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
             _workflow_mod.seed_patient(session_id, case_patient)
         await safe_send({"type": "begin", "id": session_id})
 
-    # Keep UI transcript tracking separate from processed final turns. AssemblyAI
-    # can emit a partial followed by an identical final event.
+    # Keep UI transcript tracking separate from final turns. AssemblyAI can emit
+    # a partial followed by an identical final event, so dedupe final turns here.
     last_transcript = ""
-    last_processed_turn = None
-    last_processed_text = ""
+    last_submitted_turn = None
+    last_submitted_text = ""
+    turn_ids = itertools.count(1)
+    failed_turns: dict[int, str] = {}
     session_id: str | None = None
 
-    async def on_turn(client, event):
-        nonlocal last_transcript, last_processed_turn, last_processed_text
-        # event.transcript may be partial; send incremental updates instead
-        text = getattr(event, "transcript", "") or ""
-        is_final = bool(getattr(event, "end_of_turn", False))
+    async def report_status(turn_id: int, status: str, code: str | None = None):
+        payload = {"type": "chunk_status", "turn_id": turn_id, "status": status}
+        if code:
+            payload["code"] = code
+        await safe_send(payload)
 
+    def remember_failed(turn_id: int, text: str):
+        failed_turns[turn_id] = text
+        while len(failed_turns) > MAX_FAILED_TURNS:
+            failed_turns.pop(next(iter(failed_turns)))
+
+    async def process_with_retries(sid: str, text: str) -> dict:
+        """Run one chunk. Transient LLM failures are retried with backoff; the
+        final attempt's error propagates. Failed attempts leave state unchanged,
+        so retrying the same text is safe."""
+        for delay in (*RETRY_DELAYS, None):
+            try:
+                return await process_chunk(sid, text)
+            except TRANSIENT_LLM_ERRORS as exc:
+                if delay is None:
+                    raise
+                logger.warning("transient LLM failure (%s); retrying in %.0fs", type(exc).__name__, delay)
+                await asyncio.sleep(delay)
+
+    async def handle_turn(turn: Turn):
+        """Runs on the worker: one final turn, processed in order."""
+        sid = session_id or "default"
+        try:
+            result = await process_with_retries(sid, turn.text)
+        except Exception as exc:
+            if isinstance(exc, LLMAPIError):
+                logger.warning("chunk %d not applied: %s", turn.turn_id, type(exc).__name__)
+            else:
+                logger.exception("langgraph process_chunk failed")
+            remember_failed(turn.turn_id, turn.text)
+            code = "llm_rate_limit" if isinstance(exc, LLMRateLimitError) else "processing"
+            await report_status(turn.turn_id, "failed", code)
+            return
+
+        await safe_send({
+            "type": "state",
+            "session_id": sid,
+            "report": result.get("report"),
+            "updated_fields": result.get("updated_fields"),
+            "is_finished": result.get("is_finished"),
+        })
+        if result.get("skipped"):
+            await report_status(turn.turn_id, "ignored", result["skipped"])
+        elif result.get("error_code"):
+            remember_failed(turn.turn_id, turn.text)
+            await report_status(turn.turn_id, "failed", result["error_code"])
+        else:
+            await report_status(turn.turn_id, "applied" if result.get("updated_fields") else "nothing")
+
+    async def retry_turn(raw_turn_id, under_review: bool):
+        try:
+            turn_id = int(raw_turn_id)
+        except (TypeError, ValueError):
+            return
+        if under_review:
+            await report_status(turn_id, "ignored", "under_review")
+            return
+        text = failed_turns.pop(turn_id, None)
+        if text is None:
+            await report_status(turn_id, "ignored", "unknown_turn")
+            return
+        worker.submit(Turn(text=text, turn_id=turn_id))
+
+    worker = ChunkWorker(handle_turn)
+
+    async def on_turn(client, event):
+        nonlocal last_transcript, last_submitted_turn, last_submitted_text
+        is_final = bool(getattr(event, "end_of_turn", False))
+        turn_order = getattr(event, "turn_order", None)
         # language_detection=False does not guarantee that the provider will
         # reject other scripts, so normalize those characters locally first.
-        text = _english_only_text(text)
+        text = _english_only_text(getattr(event, "transcript", "") or "")
 
-        # Do not display or process turns that AssemblyAI identifies as another
-        # language. For final turns, also reject likely noise hallucinations.
-        if is_final and (not text or not _accepted_final_turn(event)):
-            last_transcript = ""
-            return
         if not is_final:
+            # Partials are display-only: skip other languages and unchanged text.
             language_code = getattr(event, "language_code", None)
             if language_code and language_code.lower().split("-")[0] != "en":
                 return
-
-        # If nothing changed and not final, skip to avoid duplicates
-        if text == last_transcript and not is_final:
+            if text == last_transcript:
+                return
+            last_transcript = text
+            await safe_send({"type": "turn", "turn_order": turn_order, "transcript": text, "is_final": False})
             return
 
-        last_transcript = text
+        last_transcript = ""
+        if not text:
+            return
+        # AssemblyAI can send an identical final event twice; handle each turn once.
+        if text == last_submitted_text and (turn_order is None or turn_order == last_submitted_turn):
+            return
+        last_submitted_text = text
+        last_submitted_turn = turn_order
 
-        payload = {
-            "type": "turn",
-            "turn_order": getattr(event, "turn_order", None),
-            "transcript": text,
-            "is_final": is_final,
-        }
-        await safe_send(payload)
-
-        # Process only complete turns. Partial events are for display and may
-        # contain cumulative text that would otherwise be appended twice.
-        try:
-            turn_order = getattr(event, "turn_order", None)
-            duplicate_final = (
-                is_final
-                and text == last_processed_text
-                and (turn_order is None or turn_order == last_processed_turn)
-            )
-            if is_final and text and not duplicate_final:
-                sid = session_id or "default"
-                try:
-                    result = await process_chunk(sid, text)
-                    state_payload = {
-                        "type": "state",
-                        "session_id": sid,
-                        "report": result.get("report"),
-                        "updated_fields": result.get("updated_fields"),
-                        "is_finished": result.get("is_finished"),
-                    }
-                    await safe_send(state_payload)
-                    if result.get("error_code"):
-                        await safe_send({
-                            "type": "error",
-                            "code": result["error_code"],
-                            "error": result.get("error_message") or "chunk rejected",
-                        })
-                    last_processed_turn = turn_order
-                    last_processed_text = text
-                except Exception as e:
-                    if isinstance(e, LLMRateLimitError):
-                        logger.warning("LLM rate limit prevented transcript extraction: %s", e)
-                        await safe_send({"type": "error", "code": "llm_rate_limit", "error": "LLM rate limited; please try again shortly"})
-                    else:
-                        logger.exception("langgraph process_chunk failed: %s", e)
-                        await safe_send({"type": "error", "code": "processing", "error": "processing error"})
-        except Exception:
-            logger.exception("error while processing turn")
-        # If this was a final turn, clear last_transcript so the next turn starts fresh
-        if is_final:
-            last_transcript = ""
+        turn_id = next(turn_ids)
+        await safe_send({"type": "turn", "turn_id": turn_id, "turn_order": turn_order, "transcript": text, "is_final": True})
+        # Every final turn gets a status: nothing is dropped silently.
+        reason = _final_turn_ignore_reason(event)
+        if reason:
+            await report_status(turn_id, "ignored", reason)
+            return
+        # Returns at once; extraction happens on the worker, so this callback
+        # (and partial transcripts) is never held up by the LLM.
+        worker.submit(Turn(text=text, turn_id=turn_id))
 
     async def on_termination(client, event):
         await safe_send({"type": "termination"})
@@ -281,6 +338,53 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
             msg = str(event)
         await safe_send({"type": "error", "code": "stt", "error": msg})
 
+    async def finish_dictation(sid_hint: str | None):
+        """Stop: flush the open utterance, close STT, let queued turns finish, then finalize."""
+        # 1. Ask STT to end the open utterance now, so its final turn is emitted
+        #    even if the speaker didn't pause before pressing Stop.
+        try:
+            await transcriber.force_endpoint()
+        except Exception:
+            logger.exception("force_endpoint failed")
+        # 2. Close STT. The SDK waits for its termination event, and final turns
+        #    arriving meanwhile reach on_turn, which enqueues them.
+        try:
+            await transcriber.disconnect(terminate=True)
+        except Exception:
+            logger.exception("failed to disconnect transcriber")
+        # 3. Let every queued turn finish, bounded so a hung LLM can't block Stop.
+        if not await worker.drain(_stop_drain_timeout_seconds()):
+            abandoned = await worker.cancel()
+            logger.warning("stop timed out; abandoning %d turn(s) for session %s", abandoned, sid_hint)
+            await safe_send({
+                "type": "error",
+                "code": "processing",
+                "error": f"{abandoned} dictated part(s) could not be processed in time; please add them manually",
+            })
+        # 4. Finalize the report and hand it to the clinician for review.
+        sid = session_id or "default"
+        try:
+            from app.services.llm.provider import build_default_llm
+
+            final = await finalize(sid, llm=build_default_llm())
+            await safe_send({
+                "type": "state",
+                "session_id": sid,
+                "report": final.get("report"),
+                "updated_fields": [],
+                "is_finished": final.get("is_finished", False),
+                "awaiting_review": final.get("awaiting_review", False),
+            })
+            if final.get("error_code"):
+                await safe_send({
+                    "type": "error",
+                    "code": final["error_code"],
+                    "error": final.get("error_message") or "finalize error",
+                })
+        except Exception:
+            logger.exception("finalize failed for session %s", sid)
+            await safe_send({"type": "error", "code": "finalize", "error": "could not finalize the report"})
+
     # Register handlers
     transcriber.on(RealTimeEvents.Begin, on_begin)
     transcriber.on(RealTimeEvents.Turn, on_turn)
@@ -289,6 +393,7 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
 
     try:
         await transcriber.connect(params)
+        worker.start()
 
         # Read loop from client websocket. While dictating, audio is streamed
         # to AssemblyAI. After `stop`, the transcriber is closed but the socket
@@ -314,6 +419,10 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
                 if data.get("type") == "close":
                     break
 
+                if data.get("type") == "retry":
+                    await retry_turn(data.get("turn_id"), under_review=reviewing)
+                    continue
+
                 # 'audio' field contains base64 encoded bytes; ignored once reviewing
                 audio_b64 = data.get("audio")
                 if audio_b64 and not reviewing:
@@ -327,35 +436,7 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
 
                 if data.get("type") == "stop" and not reviewing:
                     reviewing = True
-                    # Close STT first so in-flight turns can flush before
-                    # finalize. Turns that still arrive after finalize are
-                    # ignored by the workflow (the report is under review).
-                    try:
-                        await transcriber.disconnect(terminate=True)
-                    except Exception:
-                        logger.exception("failed to disconnect transcriber")
-                    sid = session_id or "default"
-                    try:
-                        from app.services.llm.provider import build_default_llm
-
-                        final = await finalize(sid, llm=build_default_llm())
-                        await safe_send({
-                            "type": "state",
-                            "session_id": sid,
-                            "report": final.get("report"),
-                            "updated_fields": [],
-                            "is_finished": final.get("is_finished", False),
-                            "awaiting_review": final.get("awaiting_review", False),
-                        })
-                        if final.get("error_code"):
-                            await safe_send({
-                                "type": "error",
-                                "code": final["error_code"],
-                                "error": final.get("error_message") or "finalize error",
-                            })
-                    except Exception:
-                        logger.exception("finalize failed for session %s", sid)
-                        await safe_send({"type": "error", "code": "finalize", "error": "could not finalize the report"})
+                    await finish_dictation(session_id)
 
         except WebSocketDisconnect:
             # client disconnected
@@ -374,6 +455,7 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
             pass
         # Live state is not kept after the session ends; the clinician-approved
         # report is saved separately through the reports API.
+        await worker.cancel()
         _workflow_mod.discard_session(session_id or "default")
         try:
             await ws.close()

@@ -50,3 +50,6 @@ coverage/
 
 # Runtime graph session state (contains dictated content)
 backend/app/graph/sessions/
+
+# Evaluation run output (baseline.json is tracked)
+backend/evals/results/

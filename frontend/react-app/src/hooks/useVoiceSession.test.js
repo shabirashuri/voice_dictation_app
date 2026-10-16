@@ -94,6 +94,8 @@ describe("useVoiceSession", () => {
     fetch.mockResolvedValue(jsonResponse(201, { id: 7 }));
     const { result } = renderHook(() => useVoiceSession(OPTIONS));
     const socket = await reachReview(result);
+    act(() => socket.serverSend({ type: "turn", turn_id: 1, transcript: "Specimen is a gastric biopsy.", is_final: true }));
+    act(() => socket.serverSend({ type: "chunk_status", turn_id: 1, status: "applied" }));
 
     act(() => result.current.updateDraftField("diagnosis", "Chronic gastritis, edited."));
     act(() => result.current.acknowledgeAiComment(true));
@@ -111,6 +113,7 @@ describe("useVoiceSession", () => {
     expect(body.comment_source).toBe("ai");
     expect(body.report.diagnosis).toBe("Chronic gastritis, edited.");
     expect(body.report).not.toHaveProperty("comment_source");
+    expect(body.transcript).toEqual([{ text: "Specimen is a gastric biopsy.", status: "applied" }]);
 
     expect(result.current.phase).toBe("saved");
     expect(result.current.savedReportId).toBe(7);
@@ -266,5 +269,45 @@ describe("useVoiceSession", () => {
     });
     expect(result.current.phase).toBe("idle");
     expect(stop).toHaveBeenCalled();
+  });
+
+  it("tracks each final turn's status from chunk_status events", async () => {
+    const { result } = renderHook(() => useVoiceSession(OPTIONS));
+    const socket = await startRecording(result);
+    act(() => socket.serverSend({ type: "turn", turn_id: 1, transcript: "Specimen is a gastric biopsy.", is_final: true }));
+    expect(result.current.transcripts).toEqual([
+      { id: 1, text: "Specimen is a gastric biopsy.", status: "pending", code: null },
+    ]);
+    act(() => socket.serverSend({ type: "chunk_status", turn_id: 1, status: "applied" }));
+    expect(result.current.transcripts[0]).toMatchObject({ status: "applied", code: null });
+  });
+
+  it("keeps partial transcripts out of the finished lines", async () => {
+    const { result } = renderHook(() => useVoiceSession(OPTIONS));
+    const socket = await startRecording(result);
+    act(() => socket.serverSend({ type: "turn", transcript: "Specimen is a", is_final: false }));
+    expect(result.current.livePartial).toBe("Specimen is a");
+    expect(result.current.transcripts).toEqual([]);
+  });
+
+  it("retries a failed line: sends the request and shows it as pending again", async () => {
+    const { result } = renderHook(() => useVoiceSession(OPTIONS));
+    const socket = await startRecording(result);
+    act(() => socket.serverSend({ type: "turn", turn_id: 4, transcript: "Diagnosis is gastritis.", is_final: true }));
+    act(() => socket.serverSend({ type: "chunk_status", turn_id: 4, status: "failed", code: "llm_rate_limit" }));
+    expect(result.current.transcripts[0]).toMatchObject({ status: "failed", code: "llm_rate_limit" });
+
+    act(() => result.current.retryTurn(4));
+    expect(socket.sent.at(-1)).toEqual({ type: "retry", turn_id: 4 });
+    expect(result.current.transcripts[0]).toMatchObject({ status: "pending", code: null });
+  });
+
+  it("does not send a retry when the socket is closed", async () => {
+    const { result } = renderHook(() => useVoiceSession(OPTIONS));
+    const socket = await startRecording(result);
+    act(() => socket.serverSend({ type: "chunk_status", turn_id: 2, status: "failed", code: "processing" }));
+    act(() => socket.close());
+    act(() => result.current.retryTurn(2));
+    expect(socket.sent.some((m) => m.type === "retry")).toBe(false);
   });
 });

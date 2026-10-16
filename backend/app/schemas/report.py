@@ -8,6 +8,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # Generous per-field cap; protects the API from runaway payloads.
 MAX_FIELD_LENGTH = 20_000
 
+MAX_LINE_LENGTH = 5_000
+MAX_TRANSCRIPT_LINES = 2_000
+
 REPORT_FIELDS = (
     "patient",
     "specimen",
@@ -34,12 +37,21 @@ class ReportFields(BaseModel):
         return (value or "").strip() if isinstance(value, str) or value is None else value
 
 
+class TranscriptLine(BaseModel):
+    """One final speech-to-text line and what happened to it."""
+
+    text: str = Field(..., max_length=MAX_LINE_LENGTH)
+    status: Literal["pending", "applied", "nothing", "failed", "ignored"] = "pending"
+
+
 class ReportCreate(BaseModel):
     """Body of POST /cases/{case_id}/report: the clinician-approved report."""
 
     session_id: Optional[str] = Field(None, max_length=128)
     report: ReportFields
     comment_source: Optional[Literal["doctor", "ai"]] = None
+    # The session's final transcript lines, kept for later accuracy review.
+    transcript: Optional[list[TranscriptLine]] = Field(None, max_length=MAX_TRANSCRIPT_LINES)
 
     @model_validator(mode="after")
     def _check_comment_and_content(self):
@@ -66,6 +78,7 @@ class ReportOut(BaseModel):
     comments: str = ""
     comment_source: Optional[Literal["doctor", "ai"]] = None
     status: Literal["draft", "approved"]
+    transcript: Optional[list[TranscriptLine]] = None
     created_at: datetime
     updated_at: datetime
     approved_at: Optional[datetime] = None
@@ -80,6 +93,7 @@ class ReportOut(BaseModel):
             **{name: getattr(row, name) or "" for name in REPORT_FIELDS},
             comment_source=row.comment_source,
             status=row.status,
+            transcript=row.transcript,
             created_at=row.created_at,
             updated_at=row.updated_at,
             approved_at=row.approved_at,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from app.graph.grounding import check_grounding
 from app.graph.state import LangGraphState
 from app.prompts.comment import build_comment_prompt
 from app.services.llm.provider import LLMRateLimitError
@@ -42,6 +43,13 @@ async def generate_comment_node(state: LangGraphState, llm=None) -> dict:
         }
 
     if not text:
+        return {}
+    # The AI comment may only restate the report. An unsupported statement (e.g.
+    # "no additional pathology") is withheld, leaving the comment to the clinician.
+    source = " ".join(str(getattr(report, field) or "") for field in ("patient", "specimen", "gross_description", "microscopic_description", "diagnosis"))
+    problems = check_grounding(source, text, label="comment")
+    if problems:
+        logger.warning("AI comment withheld: %d statement(s) not supported by the report", len(problems))
         return {}
     report.comments = text
     report.comment_source = "ai"

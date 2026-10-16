@@ -14,9 +14,11 @@ def final_validate_node(state: LangGraphState) -> dict:
     try:
         Report.model_validate(state.report.model_dump())
     except ValidationError as exc:
-        logger.warning("final report validation failed: %s", exc)
+        # str(exc) echoes the report text; log locations only.
+        locations = sorted({".".join(str(part) for part in err["loc"]) for err in exc.errors()})
+        logger.warning("final report validation failed in: %s", ", ".join(locations))
         return {
-            "validation_errors": [str(exc)],
+            "validation_errors": [f"invalid field: {location}" for location in locations],
             "error_code": "finalize",
             "error_message": "The final report failed validation.",
         }

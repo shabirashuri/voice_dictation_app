@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 KEYWORD_MAP = {
     "patient": ["patient", "name"],
     "specimen": ["specimen", "biopsy", "sample"],
@@ -7,6 +9,13 @@ KEYWORD_MAP = {
     "microscopic_description": ["microscopic", "histology", "cells", "gland"],
     "diagnosis": ["diagnosis", "diagnose", "impression"],
     "comments": ["recommend", "comment", "note", "clinical correlation"],
+}
+
+
+# Whole words (plural allowed), so "name" doesn't match "rename" or "note" "denote".
+_PATTERNS = {
+    section: [re.compile(rf"\b{re.escape(kw)}s?\b") for kw in keywords]
+    for section, keywords in KEYWORD_MAP.items()
 }
 
 
@@ -21,8 +30,8 @@ async def classify_sections(text: str) -> list:
     txt = text.lower()
     hits = []
     for section, keywords in KEYWORD_MAP.items():
-        for kw in keywords:
-            if kw in txt:
+        for pattern in _PATTERNS[section]:
+            if pattern.search(txt):
                 hits.append(section)
                 break
     # preserve order of appearance if possible

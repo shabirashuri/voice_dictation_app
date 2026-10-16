@@ -26,6 +26,13 @@ class LLMRateLimitError(LLMAPIError):
     """The provider throttled the request or the account has exhausted quota."""
 
 
+class LLMTransientError(LLMAPIError):
+    """A failure that may succeed on retry: timeout, connection error, or 5xx.
+
+    Client errors (bad key, bad request) are plain LLMAPIError and are not retried.
+    """
+
+
 class LLMResponseError(LLMProviderError):
     """The provider returned content that was not valid extraction JSON."""
 
@@ -38,6 +45,36 @@ EXTRACTION_FIELDS = (
     "diagnosis",
     "comments",
 )
+
+# Strict structured output: the model can only return this shape. Models that
+# lack json_schema support use GROQ_RESPONSE_FORMAT=json_object instead.
+EXTRACTION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "extraction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["updates"],
+            "properties": {
+                "updates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["target_section", "operation", "content"],
+                        "properties": {
+                            "target_section": {"type": "string", "enum": list(EXTRACTION_FIELDS)},
+                            "operation": {"type": "string", "enum": ["append", "replace"]},
+                            "content": {"type": "string"},
+                        },
+                    },
+                }
+            },
+        },
+    },
+}
 
 
 
@@ -61,6 +98,11 @@ class GroqLLM(LLMBase):
             self.base_url = self.base_url[:-3].rstrip("/")
         self.model = model or os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
         self.max_retries = max(0, int(os.getenv("GROQ_MAX_RETRIES", "0")))
+        self.response_format = (
+            {"type": "json_object"}
+            if os.getenv("GROQ_RESPONSE_FORMAT", "json_schema") == "json_object"
+            else EXTRACTION_RESPONSE_FORMAT
+        )
         if not self.api_key:
             raise RuntimeError("GROQ_API_KEY is not set")
 
@@ -121,7 +163,7 @@ class GroqLLM(LLMBase):
                 return resp.json()
         except httpx.TimeoutException as exc:
             logger.exception("LLM request timed out")
-            raise LLMAPIError("LLM request timed out") from exc
+            raise LLMTransientError("LLM request timed out") from exc
         except httpx.HTTPStatusError as exc:
             detail = ""
             error_code = ""
@@ -142,12 +184,13 @@ class GroqLLM(LLMBase):
                 exc.response.status_code,
                 suffix,
             )
-            raise LLMAPIError(
+            error_type = LLMTransientError if exc.response.status_code >= 500 else LLMAPIError
+            raise error_type(
                 f"LLM request failed with HTTP status {exc.response.status_code}{suffix}"
             ) from exc
         except httpx.RequestError as exc:
             logger.exception("LLM request failed")
-            raise LLMAPIError("LLM request failed") from exc
+            raise LLMTransientError("LLM request failed") from exc
         except ValueError as exc:
             logger.exception("LLM returned invalid JSON at the HTTP response level")
             raise LLMResponseError("LLM returned invalid HTTP response JSON") from exc
@@ -178,7 +221,7 @@ class GroqLLM(LLMBase):
                     return decoder.raw_decode(text[index:])[0]
                 except json.JSONDecodeError:
                     continue
-            logger.exception("LLM returned invalid extraction JSON")
+            logger.warning("LLM returned invalid extraction JSON")
             raise LLMResponseError("LLM returned invalid JSON")
 
     @staticmethod
@@ -229,7 +272,7 @@ OUTPUT SCHEMA:
                 [{"role": "system", "content": EXTRACTION_SYSTEM_PROMPT}, user],
                 temperature=0.0,
                 max_tokens=1024,
-                response_format={"type": "json_object"},
+                response_format=self.response_format,
             )
             parsed = self._json_content(self._response_content(res))
             if hasattr(ExtractionResponse, "model_validate"):
@@ -239,8 +282,10 @@ OUTPUT SCHEMA:
         except LLMProviderError:
             raise
         except Exception as exc:
-            logger.exception("LLM extraction schema validation failed")
-            raise LLMResponseError("LLM extraction response failed schema validation") from exc
+            # Validation errors echo the model output (dictated text), so log
+            # the error type only and drop the chained exception.
+            logger.warning("LLM extraction schema validation failed (%s)", type(exc).__name__)
+            raise LLMResponseError("LLM extraction response failed schema validation") from None
 
         if not validated.updates:
             logger.info("LLM extraction returned an empty update list")

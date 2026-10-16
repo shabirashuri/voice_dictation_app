@@ -193,3 +193,43 @@ describe("cases", () => {
     expect(screen.getByLabelText("Diagnosis").readOnly).toBe(true);
   });
 });
+
+it("shows a failed line with a Retry button that asks the server to re-run it", async () => {
+  await renderSignedIn();
+  await openCase("John Doe");
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /start session/i }));
+  });
+  const socket = lastSocket();
+  await act(async () => {
+    await socket.open();
+  });
+  act(() => socket.serverSend({ type: "turn", turn_id: 1, transcript: "Specimen is a gastric biopsy.", is_final: true }));
+  act(() => socket.serverSend({ type: "chunk_status", turn_id: 1, status: "failed", code: "llm_rate_limit" }));
+
+  expect(screen.getByText("AI busy: not added")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Retry: Specimen is a gastric biopsy." }));
+  expect(socket.sent.at(-1)).toEqual({ type: "retry", turn_id: 1 });
+  expect(screen.getByLabelText("Being processed")).toBeTruthy();
+});
+
+it("shows added and ignored lines with their reasons and no Retry button", async () => {
+  await renderSignedIn();
+  await openCase("John Doe");
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /start session/i }));
+  });
+  const socket = lastSocket();
+  await act(async () => {
+    await socket.open();
+  });
+  act(() => socket.serverSend({ type: "turn", turn_id: 1, transcript: "Specimen is a gastric biopsy.", is_final: true }));
+  act(() => socket.serverSend({ type: "chunk_status", turn_id: 1, status: "applied" }));
+  act(() => socket.serverSend({ type: "turn", turn_id: 2, transcript: "mumble", is_final: true }));
+  act(() => socket.serverSend({ type: "chunk_status", turn_id: 2, status: "ignored", code: "low_confidence" }));
+
+  expect(screen.getByText("Added")).toBeTruthy();
+  expect(screen.getByText("Low confidence: not added")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /^Retry/ })).toBeNull();
+});
+

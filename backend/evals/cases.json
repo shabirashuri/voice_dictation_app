@@ -1,0 +1,238 @@
+[
+  {
+    "id": "gastric_biopsy_full",
+    "note": "Benign gastric biopsy, dictated in order",
+    "chunks": [
+      "The specimen is a gastric biopsy from the antrum.",
+      "Microscopically there is chronic inactive gastritis. No Helicobacter organisms are identified.",
+      "Final diagnosis is chronic inactive gastritis."
+    ],
+    "expect": {
+      "specimen": [
+        "gastric biopsy",
+        "antrum"
+      ],
+      "microscopic_description": [
+        "chronic inactive gastritis",
+        "helicobacter"
+      ],
+      "diagnosis": [
+        "chronic inactive gastritis"
+      ]
+    },
+    "forbid": [
+      "malignan",
+      "carcinoma",
+      "dysplasia"
+    ]
+  },
+  {
+    "id": "skin_punch_negation",
+    "note": "Skin punch with an explicit negation and laterality",
+    "chunks": [
+      "Skin punch biopsy from the left forearm.",
+      "Sections show a compact seborrheic keratosis. There is no atypia."
+    ],
+    "expect": {
+      "specimen": [
+        "skin punch",
+        "left forearm"
+      ],
+      "microscopic_description": [
+        "seborrheic keratosis",
+        "atypia"
+      ]
+    },
+    "forbid": [
+      "melanoma",
+      "malignan",
+      "right"
+    ]
+  },
+  {
+    "id": "colon_polyp_out_of_order",
+    "note": "Microscopy dictated before the specimen",
+    "chunks": [
+      "Microscopically there is a tubular adenoma without high grade dysplasia.",
+      "The specimen is a colon polypectomy.",
+      "Diagnosis is tubular adenoma."
+    ],
+    "expect": {
+      "specimen": [
+        "colon polypectomy"
+      ],
+      "microscopic_description": [
+        "tubular adenoma",
+        "dysplasia"
+      ],
+      "diagnosis": [
+        "tubular adenoma"
+      ]
+    },
+    "forbid": [
+      "carcinoma",
+      "malignan"
+    ]
+  },
+  {
+    "id": "specimen_correction",
+    "note": "Spoken correction must replace the specimen, not append to it",
+    "chunks": [
+      "The specimen is a gastric biopsy.",
+      "Actually, I meant the specimen is a kidney biopsy."
+    ],
+    "expect": {
+      "specimen": [
+        "kidney biopsy"
+      ]
+    },
+    "forbid": [
+      "gastric"
+    ]
+  },
+  {
+    "id": "breast_core_measurement",
+    "note": "Laterality and a measurement with a unit",
+    "chunks": [
+      "The specimen is a left breast core biopsy.",
+      "The tumour measures 2.5 cm in greatest dimension."
+    ],
+    "expect": {
+      "specimen": [
+        "left breast"
+      ],
+      "gross_description": [
+        "2.5 cm"
+      ]
+    },
+    "forbid": [
+      "right"
+    ]
+  },
+  {
+    "id": "negative_margins",
+    "note": "Negated finding in a resection",
+    "chunks": [
+      "Specimen is a partial mastectomy.",
+      "The margins are negative for invasive carcinoma.",
+      "There is no lymphovascular invasion."
+    ],
+    "expect": {
+      "specimen": [
+        "mastectomy"
+      ],
+      "microscopic_description": [
+        "margins",
+        "negative",
+        "lymphovascular"
+      ]
+    },
+    "forbid": [
+      "metastas"
+    ]
+  },
+  {
+    "id": "doctor_comment_kept",
+    "note": "A comment the clinician dictated is kept as clinician-authored",
+    "chunks": [
+      "Specimen is a gastric biopsy.",
+      "Diagnosis is chronic gastritis.",
+      "Recommend clinical correlation."
+    ],
+    "expect": {
+      "comments": [
+        "clinical correlation"
+      ]
+    },
+    "expect_comment_source": [
+      "doctor"
+    ],
+    "forbid": []
+  },
+  {
+    "id": "ai_comment_only",
+    "note": "No dictated comment: at most one AI comment, and nothing invented",
+    "chunks": [
+      "Specimen is a gastric biopsy.",
+      "Diagnosis is chronic gastritis."
+    ],
+    "expect": {},
+    "expect_comment_source": [
+      "ai",
+      null
+    ],
+    "forbid": [
+      "no additional",
+      "malignan",
+      "carcinoma"
+    ]
+  },
+  {
+    "id": "patient_identity",
+    "note": "Patient name is captured",
+    "chunks": [
+      "Patient is Jane Roe, medical record 4455.",
+      "Specimen is a gastric biopsy."
+    ],
+    "expect": {
+      "patient": [
+        "jane roe"
+      ]
+    },
+    "forbid": [
+      "john doe"
+    ]
+  },
+  {
+    "id": "chit_chat",
+    "note": "Non-report speech must produce no report content",
+    "chunks": [
+      "Okay, let me think about that for a second.",
+      "Sorry, go ahead."
+    ],
+    "expect": {},
+    "expect_empty": true,
+    "forbid": []
+  },
+  {
+    "id": "multi_section_one_chunk",
+    "note": "One chunk updates three sections",
+    "chunks": [
+      "The specimen is a colon polypectomy. Microscopically there is tubular adenoma without dysplasia. Diagnosis is tubular adenoma."
+    ],
+    "expect": {
+      "specimen": [
+        "colon"
+      ],
+      "microscopic_description": [
+        "tubular adenoma"
+      ],
+      "diagnosis": [
+        "tubular adenoma"
+      ]
+    },
+    "forbid": [
+      "malignan"
+    ]
+  },
+  {
+    "id": "spelled_number_measurement",
+    "note": "Spelled-out decimal must become a measurement",
+    "chunks": [
+      "Gross description: a nodule measuring two point five centimetres.",
+      "Specimen is a breast core biopsy."
+    ],
+    "expect": {
+      "gross_description": [
+        "two point five|2.5"
+      ],
+      "specimen": [
+        "breast core"
+      ]
+    },
+    "forbid": [
+      "3 cm",
+      "5 cm"
+    ]
+  }
+]

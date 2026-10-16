@@ -47,6 +47,7 @@ async def create_approved_report(db: AsyncSession, case: Case, data: ReportCreat
         session_id=data.session_id,
         **{name: getattr(data.report, name) for name in REPORT_FIELDS},
         comment_source=data.comment_source,
+        transcript=[line.model_dump() for line in data.transcript] if data.transcript is not None else None,
         status="approved",
         approved_at=datetime.now(timezone.utc),
     )

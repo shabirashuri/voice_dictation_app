@@ -136,3 +136,35 @@ async def test_case_requires_a_patient_name(client, body):
 async def test_missing_case_is_404(client):
     headers, _ = await signup(client)
     assert (await client.get("/cases/999", headers=headers)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_transcript_is_stored_with_the_report(client):
+    headers, _ = await signup(client)
+    case = await create_case(client, headers)
+    lines = [{"text": "Specimen is a gastric biopsy.", "status": "applied"}, {"text": "uh", "status": "ignored"}]
+
+    res = await client.post(
+        f"/cases/{case['id']}/report",
+        json={"report": REPORT, "comment_source": "doctor", "transcript": lines},
+        headers=headers,
+    )
+    assert res.status_code == 201, res.text
+    assert res.json()["transcript"] == lines
+    assert (await client.get(f"/cases/{case['id']}/report", headers=headers)).json()["transcript"] == lines
+
+
+@pytest.mark.asyncio
+async def test_transcript_is_optional_and_validated(client):
+    headers, _ = await signup(client)
+    case = await create_case(client, headers)
+    bad = await client.post(
+        f"/cases/{case['id']}/report",
+        json={"report": REPORT, "comment_source": "doctor", "transcript": [{"text": "x", "status": "bogus"}]},
+        headers=headers,
+    )
+    assert bad.status_code == 422
+    ok = await client.post(
+        f"/cases/{case['id']}/report", json={"report": REPORT, "comment_source": "doctor"}, headers=headers
+    )
+    assert ok.status_code == 201 and ok.json()["transcript"] is None

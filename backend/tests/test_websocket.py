@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from assemblyai.streaming.v3 import RealTimeEvents
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from app.api.websocket import voice
 from app.services.llm.provider import LLMRateLimitError
 from app.services.streaming.manager import session_manager
 
@@ -18,8 +20,14 @@ class FakeLLM:
 
     def __init__(self):
         self.generate_called = 0
+        self.extract_calls = 0
+        self.failures = 0  # the next N extract calls raise a rate-limit error
 
     async def extract(self, prompt="", **kwargs):
+        self.extract_calls += 1
+        if self.failures > 0:
+            self.failures -= 1
+            raise LLMRateLimitError("quota exceeded")
         chunk = kwargs.get("chunk", "").lower()
         if "ratelimit" in chunk:
             raise LLMRateLimitError("quota exceeded")
@@ -27,6 +35,8 @@ class FakeLLM:
             return BAD_UPDATE
         if "biopsy" in chunk:
             return {"updates": [{"target_section": "specimen", "operation": "append", "content": "Gastric biopsy"}]}
+        if "diagnosis" in chunk:
+            return {"updates": [{"target_section": "diagnosis", "operation": "append", "content": "Gastritis"}]}
         return {"updates": []}
 
     async def generate(self, prompt="", **kwargs):
@@ -43,7 +53,10 @@ class FakeTranscriber:
     def on(self, event, handler):
         self.handlers[event] = handler
 
+    connect_params = []
+
     async def connect(self, params):
+        FakeTranscriber.connect_params.append(params)
         await self.handlers[RealTimeEvents.Begin](self, SimpleNamespace(id="ws_test"))
 
     async def stream(self, audio_bytes):
@@ -63,6 +76,7 @@ def ws_client(app, monkeypatch):
     llm = FakeLLM()
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test")
     monkeypatch.setattr(voice, "AsyncRealTimeTranscriber", FakeTranscriber)
+    monkeypatch.setattr(voice, "RETRY_DELAYS", (0.0, 0.0, 0.0))  # no real backoff in tests
     monkeypatch.setattr("app.services.llm.provider.build_default_llm", lambda: llm)
     return TestClient(app), llm
 
@@ -139,8 +153,8 @@ def test_llm_rate_limit_reports_coded_error_and_keeps_session(ws_client):
         _auth(ws, token, case["id"])
         _next(ws, "begin")
         ws.send_text(_audio("ratelimit this chunk"))
-        err = _next(ws, "error")
-        assert err["code"] == "llm_rate_limit"
+        status = _next(ws, "chunk_status")
+        assert status["status"] == "failed" and status["code"] == "llm_rate_limit"
         # the session keeps working afterwards
         ws.send_text(_audio("Specimen is a gastric biopsy."))
         assert _next(ws, "state")["report"]["specimen"] == "Gastric biopsy"
@@ -159,7 +173,8 @@ def test_rejected_chunk_reports_validation_error_and_report_is_unchanged(ws_clie
         state = _next(ws, "state")
         assert state["updated_fields"] == []
         assert state["report"]["specimen"] == "Gastric biopsy"
-        assert _next(ws, "error")["code"] == "validation"
+        status = _next(ws, "chunk_status")
+        assert status["status"] == "failed" and status["code"] == "validation"
         ws.send_text(json.dumps({"type": "close"}))
 
 
@@ -219,3 +234,291 @@ def test_reported_case_cannot_be_dictated_again(ws_client):
     with client.websocket_connect("/ws/voice") as ws:
         _auth(ws, token, case["id"])
         _expect_auth_error(ws, "already has an approved report")
+
+
+class HoldingTranscriber(FakeTranscriber):
+    """Like AssemblyAI with no pause: audio yields only a partial turn, and the
+    final turn comes from force_endpoint() (what Stop triggers)."""
+
+    def __init__(self, api_key=None):
+        super().__init__(api_key)
+        self.pending = ""
+
+    async def stream(self, audio_bytes):
+        self.pending = audio_bytes.decode()
+        partial = SimpleNamespace(
+            transcript=self.pending, end_of_turn=False, turn_order=1, language_code="en", words=[]
+        )
+        await self.handlers[RealTimeEvents.Turn](self, partial)
+
+    async def force_endpoint(self):
+        if self.pending:
+            final = SimpleNamespace(
+                transcript=self.pending, end_of_turn=True, turn_order=1, language_code="en", words=[]
+            )
+            self.pending = ""
+            await self.handlers[RealTimeEvents.Turn](self, final)
+
+
+def test_partial_turns_keep_flowing_while_an_extraction_is_slow(ws_client, monkeypatch):
+    import threading
+
+    client, llm = ws_client
+    gate = threading.Event()
+    # Safety net: never let a regression hang the test run.
+    safety = threading.Timer(10, gate.set)
+    safety.start()
+    original = llm.extract
+
+    async def slow_first(prompt="", **kwargs):
+        if not getattr(slow_first, "done", False):
+            slow_first.done = True
+            await asyncio.to_thread(gate.wait, 10)
+        return await original(prompt=prompt, **kwargs)
+
+    llm.extract = slow_first
+    token, case, _ = _doctor_with_case(client)
+    try:
+        with client.websocket_connect("/ws/voice") as ws:
+            _auth(ws, token, case["id"])
+            _next(ws, "begin")
+            ws.send_text(_audio("Specimen is a gastric biopsy."))
+            ws.send_text(_audio("Diagnosis is gastritis."))
+            # Both turns are announced while the first extraction is still blocked.
+            first_two = [ws.receive_json()["type"], ws.receive_json()["type"]]
+            assert first_two == ["turn", "turn"]
+            assert not gate.is_set()
+            gate.set()
+            # Extraction then catches up, in order.
+            first_state = _next(ws, "state")
+            assert first_state["report"]["specimen"] == "Gastric biopsy"
+            second_state = _next(ws, "state")
+            assert second_state["report"]["diagnosis"] == "Gastritis"
+            ws.send_text(json.dumps({"type": "close"}))
+    finally:
+        gate.set()
+        safety.cancel()
+
+
+def test_last_sentence_without_a_pause_is_kept_at_stop(ws_client, monkeypatch):
+    client, llm = ws_client
+    monkeypatch.setattr("app.api.websocket.voice.AsyncRealTimeTranscriber", HoldingTranscriber)
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        ws.send_text(json.dumps({"type": "stop"}))
+        while True:
+            msg = ws.receive_json()
+            if msg.get("type") == "state" and msg.get("awaiting_review"):
+                break
+        assert msg["report"]["specimen"] == "Gastric biopsy"
+        ws.send_text(json.dumps({"type": "close"}))
+
+
+def test_stop_does_not_hang_on_a_stuck_extraction(ws_client, monkeypatch):
+    import threading
+
+    client, llm = ws_client
+    monkeypatch.setenv("STOP_DRAIN_TIMEOUT_SECONDS", "0.3")
+    gate = threading.Event()
+    safety = threading.Timer(10, gate.set)
+    safety.start()
+
+    async def stuck(prompt="", **kwargs):
+        await asyncio.to_thread(gate.wait, 10)
+        return {"updates": []}
+
+    llm.extract = stuck
+    token, case, _ = _doctor_with_case(client)
+    try:
+        with client.websocket_connect("/ws/voice") as ws:
+            _auth(ws, token, case["id"])
+            _next(ws, "begin")
+            ws.send_text(_audio("Specimen is a gastric biopsy."))
+            ws.send_text(json.dumps({"type": "stop"}))
+            errors, final = [], None
+            while final is None:
+                msg = ws.receive_json()
+                if msg.get("type") == "error":
+                    errors.append(msg["code"])
+                if msg.get("type") == "state" and msg.get("awaiting_review"):
+                    final = msg
+            assert errors == ["processing"]
+            assert final["is_finished"] is True
+            ws.send_text(json.dumps({"type": "close"}))
+    finally:
+        gate.set()
+        safety.cancel()
+
+
+class LowConfidenceTranscriber(FakeTranscriber):
+    async def stream(self, audio_bytes):
+        event = SimpleNamespace(
+            transcript=audio_bytes.decode(),
+            end_of_turn=True,
+            turn_order=1,
+            language_code="en",
+            words=[SimpleNamespace(confidence=0.2)],
+        )
+        await self.handlers[RealTimeEvents.Turn](self, event)
+
+
+def test_applied_turn_is_announced_with_its_id(ws_client):
+    client, _ = ws_client
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        turn = _next(ws, "turn")
+        assert turn["is_final"] is True and turn["turn_id"] == 1
+        _next(ws, "state")
+        status = _next(ws, "chunk_status")
+        assert status == {"type": "chunk_status", "turn_id": 1, "status": "applied"}
+        ws.send_text(json.dumps({"type": "close"}))
+
+
+def test_low_confidence_turn_is_shown_as_ignored_and_not_extracted(ws_client, monkeypatch):
+    client, llm = ws_client
+    monkeypatch.setattr(voice, "AsyncRealTimeTranscriber", LowConfidenceTranscriber)
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        turn = _next(ws, "turn")
+        assert turn["turn_id"] == 1
+        status = _next(ws, "chunk_status")
+        assert status == {"type": "chunk_status", "turn_id": 1, "status": "ignored", "code": "low_confidence"}
+        ws.send_text(json.dumps({"type": "close"}))
+    assert llm.extract_calls == 0
+
+
+def test_transient_llm_failure_is_retried_then_applied(ws_client):
+    client, llm = ws_client
+    llm.failures = 1
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        assert _next(ws, "state")["report"]["specimen"] == "Gastric biopsy"
+        assert _next(ws, "chunk_status")["status"] == "applied"
+        ws.send_text(json.dumps({"type": "close"}))
+    assert llm.extract_calls == 2
+
+
+def test_failed_chunk_can_be_retried_and_is_applied_once(ws_client):
+    client, llm = ws_client
+    llm.failures = 4  # the first try and all three retries fail
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        _next(ws, "turn")
+        failed = _next(ws, "chunk_status")
+        assert failed == {"type": "chunk_status", "turn_id": 1, "status": "failed", "code": "llm_rate_limit"}
+
+        ws.send_text(json.dumps({"type": "retry", "turn_id": 1}))
+        state = _next(ws, "state")
+        assert state["report"]["specimen"] == "Gastric biopsy"
+        assert _next(ws, "chunk_status") == {"type": "chunk_status", "turn_id": 1, "status": "applied"}
+
+        # Once applied it is no longer retryable.
+        ws.send_text(json.dumps({"type": "retry", "turn_id": 1}))
+        assert _next(ws, "chunk_status") == {
+            "type": "chunk_status", "turn_id": 1, "status": "ignored", "code": "unknown_turn",
+        }
+        ws.send_text(json.dumps({"type": "close"}))
+    assert llm.extract_calls == 5  # 4 failed attempts + 1 successful retry
+
+
+def test_retry_after_review_is_refused(ws_client):
+    client, llm = ws_client
+    llm.failures = 4
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        _next(ws, "turn")
+        _next(ws, "chunk_status")  # failed
+        ws.send_text(json.dumps({"type": "stop"}))
+        while not ws.receive_json().get("awaiting_review"):
+            pass
+        ws.send_text(json.dumps({"type": "retry", "turn_id": 1}))
+        assert _next(ws, "chunk_status") == {
+            "type": "chunk_status", "turn_id": 1, "status": "ignored", "code": "under_review",
+        }
+        ws.send_text(json.dumps({"type": "close"}))
+
+
+def test_rejected_llm_request_is_not_retried(ws_client):
+    from app.services.llm.provider import LLMAPIError
+
+    client, llm = ws_client
+
+    async def bad_key(prompt="", **kwargs):
+        llm.extract_calls += 1
+        raise LLMAPIError("LLM request failed with HTTP status 401 (invalid_api_key)")
+
+    llm.extract = bad_key
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        status = _next(ws, "chunk_status")
+        assert status["status"] == "failed" and status["code"] == "processing"
+        ws.send_text(json.dumps({"type": "close"}))
+    assert llm.extract_calls == 1
+
+
+def test_server_error_is_retried(ws_client):
+    from app.services.llm.provider import LLMTransientError
+
+    client, llm = ws_client
+    calls = {"n": 0}
+
+    async def flaky_5xx(prompt="", **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise LLMTransientError("LLM request failed with HTTP status 503")
+        return {"updates": [{"target_section": "specimen", "operation": "append", "content": "Gastric biopsy"}]}
+
+    llm.extract = flaky_5xx
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+        ws.send_text(_audio("Specimen is a gastric biopsy."))
+        assert _next(ws, "chunk_status")["status"] == "applied"
+        ws.send_text(json.dumps({"type": "close"}))
+    assert calls["n"] == 2
+
+
+
+def test_speech_to_text_is_primed_with_pathology_vocabulary(ws_client, monkeypatch):
+    from app.prompts.pathology_terms import PATHOLOGY_TERMS
+
+    monkeypatch.delenv("TURN_SILENCE_MS", raising=False)
+    FakeTranscriber.connect_params.clear()
+    client, _ = ws_client
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+
+    params = FakeTranscriber.connect_params[0]
+    assert params.keyterms_prompt == PATHOLOGY_TERMS
+    assert params.min_turn_silence == 3000
+
+
+def test_pathology_terms_respect_service_limits():
+    from app.prompts.pathology_terms import PATHOLOGY_TERMS
+
+    assert len(PATHOLOGY_TERMS) <= 100 and len(set(PATHOLOGY_TERMS)) == len(PATHOLOGY_TERMS)
+    assert all(0 < len(term) <= 50 for term in PATHOLOGY_TERMS)

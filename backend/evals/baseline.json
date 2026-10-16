@@ -1,0 +1,333 @@
+{
+  "run_at": "2026-10-16T05:32:42.834144+00:00",
+  "llm_model": "openai/gpt-oss-20b",
+  "summary": {
+    "cases": 12,
+    "cases_passed": 12,
+    "field_recall": 1.0,
+    "misroute_rate": 0.0,
+    "forbidden_hits": 0,
+    "invented_problems": 0,
+    "rejected_chunks": 0,
+    "chunk_latency_p50_s": 0.745,
+    "chunk_latency_p95_s": 1.305,
+    "finalize_latency_p50_s": 0.778
+  },
+  "cases": [
+    {
+      "id": "gastric_biopsy_full",
+      "passed": true,
+      "expected": 5,
+      "found_correct": 5,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "ai",
+      "chunks": 3,
+      "chunk_latency_s": [
+        0.878,
+        0.824,
+        0.714
+      ],
+      "finalize_latency_s": 0.638,
+      "report": {
+        "patient": "",
+        "specimen": "The specimen is a gastric biopsy from the antrum.",
+        "gross_description": "",
+        "microscopic_description": "Microscopically there is chronic inactive gastritis. No Helicobacter organisms are identified.",
+        "diagnosis": "Final diagnosis is chronic inactive gastritis.",
+        "comments": "Chronic inactive gastritis identified; no Helicobacter organisms detected."
+      }
+    },
+    {
+      "id": "skin_punch_negation",
+      "passed": true,
+      "expected": 4,
+      "found_correct": 4,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "ai",
+      "chunks": 2,
+      "chunk_latency_s": [
+        0.744,
+        0.817
+      ],
+      "finalize_latency_s": 0.899,
+      "report": {
+        "patient": "",
+        "specimen": "Skin punch biopsy from the left forearm.",
+        "gross_description": "",
+        "microscopic_description": "Sections show a compact seborrheic keratosis. There is no atypia.",
+        "diagnosis": "",
+        "comments": "Skin punch biopsy from left forearm shows compact seborrheic keratosis, no atypia."
+      }
+    },
+    {
+      "id": "colon_polyp_out_of_order",
+      "passed": true,
+      "expected": 4,
+      "found_correct": 4,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "ai",
+      "chunks": 3,
+      "chunk_latency_s": [
+        0.663,
+        1.67,
+        1.07
+      ],
+      "finalize_latency_s": 0.778,
+      "report": {
+        "patient": "",
+        "specimen": "The specimen is a colon polypectomy.",
+        "gross_description": "",
+        "microscopic_description": "Microscopically there is a tubular adenoma without high grade dysplasia.",
+        "diagnosis": "Diagnosis is tubular adenoma.",
+        "comments": "Tubular adenoma identified; no high‑grade dysplasia."
+      }
+    },
+    {
+      "id": "specimen_correction",
+      "passed": true,
+      "expected": 1,
+      "found_correct": 1,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": null,
+      "chunks": 2,
+      "chunk_latency_s": [
+        0.657,
+        0.506
+      ],
+      "finalize_latency_s": 0.779,
+      "report": {
+        "patient": "",
+        "specimen": "The specimen is a kidney biopsy.",
+        "gross_description": "",
+        "microscopic_description": "",
+        "diagnosis": "",
+        "comments": ""
+      }
+    },
+    {
+      "id": "breast_core_measurement",
+      "passed": true,
+      "expected": 2,
+      "found_correct": 2,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "ai",
+      "chunks": 2,
+      "chunk_latency_s": [
+        0.734,
+        0.821
+      ],
+      "finalize_latency_s": 0.798,
+      "report": {
+        "patient": "",
+        "specimen": "left breast core biopsy",
+        "gross_description": "The tumour measures 2.5 cm in greatest dimension.",
+        "microscopic_description": "",
+        "diagnosis": "",
+        "comments": "Left breast core biopsy shows a tumor measuring 2.5 cm."
+      }
+    },
+    {
+      "id": "negative_margins",
+      "passed": true,
+      "expected": 4,
+      "found_correct": 4,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "ai",
+      "chunks": 3,
+      "chunk_latency_s": [
+        0.826,
+        1.024,
+        0.485
+      ],
+      "finalize_latency_s": 0.738,
+      "report": {
+        "patient": "",
+        "specimen": "Specimen is a partial mastectomy.",
+        "gross_description": "",
+        "microscopic_description": "The margins are negative for invasive carcinoma. There is no lymphovascular invasion.",
+        "diagnosis": "",
+        "comments": "Partial mastectomy specimen: margins negative for invasive carcinoma; no lymphovascular invasion."
+      }
+    },
+    {
+      "id": "doctor_comment_kept",
+      "passed": true,
+      "expected": 1,
+      "found_correct": 1,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "doctor",
+      "chunks": 3,
+      "chunk_latency_s": [
+        0.745,
+        0.839,
+        0.668
+      ],
+      "finalize_latency_s": 0.006,
+      "report": {
+        "patient": "",
+        "specimen": "Specimen is a gastric biopsy.",
+        "gross_description": "",
+        "microscopic_description": "",
+        "diagnosis": "Diagnosis is chronic gastritis.",
+        "comments": "Recommend clinical correlation."
+      }
+    },
+    {
+      "id": "ai_comment_only",
+      "passed": true,
+      "expected": 0,
+      "found_correct": 0,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "ai",
+      "chunks": 2,
+      "chunk_latency_s": [
+        0.659,
+        1.305
+      ],
+      "finalize_latency_s": 0.64,
+      "report": {
+        "patient": "",
+        "specimen": "Specimen is a gastric biopsy.",
+        "gross_description": "",
+        "microscopic_description": "",
+        "diagnosis": "Diagnosis is chronic gastritis.",
+        "comments": "Chronic gastritis."
+      }
+    },
+    {
+      "id": "patient_identity",
+      "passed": true,
+      "expected": 1,
+      "found_correct": 1,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": null,
+      "chunks": 2,
+      "chunk_latency_s": [
+        0.744,
+        0.802
+      ],
+      "finalize_latency_s": 0.978,
+      "report": {
+        "patient": "Patient is Jane Roe, medical record 4455.",
+        "specimen": "Specimen is a gastric biopsy.",
+        "gross_description": "",
+        "microscopic_description": "",
+        "diagnosis": "",
+        "comments": ""
+      }
+    },
+    {
+      "id": "chit_chat",
+      "passed": true,
+      "expected": 0,
+      "found_correct": 0,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": null,
+      "chunks": 2,
+      "chunk_latency_s": [
+        0.549,
+        0.495
+      ],
+      "finalize_latency_s": 0.691,
+      "report": {
+        "patient": "",
+        "specimen": "",
+        "gross_description": "",
+        "microscopic_description": "",
+        "diagnosis": "",
+        "comments": ""
+      }
+    },
+    {
+      "id": "multi_section_one_chunk",
+      "passed": true,
+      "expected": 3,
+      "found_correct": 3,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "ai",
+      "chunks": 1,
+      "chunk_latency_s": [
+        0.784
+      ],
+      "finalize_latency_s": 0.532,
+      "report": {
+        "patient": "",
+        "specimen": "colon polypectomy",
+        "gross_description": "",
+        "microscopic_description": "tubular adenoma without dysplasia",
+        "diagnosis": "tubular adenoma",
+        "comments": "Tubular adenoma, no dysplasia noted."
+      }
+    },
+    {
+      "id": "spelled_number_measurement",
+      "passed": true,
+      "expected": 2,
+      "found_correct": 2,
+      "misrouted": 0,
+      "missed": 0,
+      "forbidden_hits": [],
+      "invented": 0,
+      "rejected_chunks": 0,
+      "comment_source": "ai",
+      "chunks": 2,
+      "chunk_latency_s": [
+        0.57,
+        1.065
+      ],
+      "finalize_latency_s": 0.913,
+      "report": {
+        "patient": "",
+        "specimen": "Specimen is a breast core biopsy.",
+        "gross_description": "a nodule measuring two point five centimetres.",
+        "microscopic_description": "",
+        "diagnosis": "",
+        "comments": "Breast core biopsy of a 2.5 cm nodule."
+      }
+    }
+  ]
+}

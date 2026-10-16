@@ -49,17 +49,19 @@ backend/app/
   graph/validation_router.py routing fns, MAX_REPAIR_ATTEMPTS, RECENT_CONTEXT_SIZE
   graph/nodes/               clean, classify, extract (raw output), validate_update, repair/reject, merge, finalize_report, generate_comment
   graph/state.py             Report, FieldUpdate, ExtractionResponse, LangGraphState (incl. graph working fields)
+  graph/grounding.py         check_grounding / check_dropped_negation: numbers, units, laterality, negations must be in the dictation (narrow, deliberate); used by validate_update and the AI comment
   graph/workflow.py          Workflow.process_chunk / finalize over the graphs; per-session lock
   graph/routers.py           module-level process_chunk()/finalize() used by the WS handler and tests
-  prompts/                   extraction + repair note, comment prompt
+  prompts/                   extraction + repair note, comment prompt, pathology_terms (STT keyterm boost)
   services/llm/provider.py   GroqLLM (OpenAI-compatible, httpx), DummyLLM, build_default_llm(), typed errors
   services/streaming/        StreamingManager: in-memory session state (deep copies), asyncio locks, TTL sweep
+  services/streaming/worker.py  ChunkWorker: per-session queue; final turns are extracted here, never inside the AssemblyAI callback
   db/session.py              async engine (asyncpg for Postgres, aiosqlite for SQLite), get_db, get_session_factory
   db/base.py                 shared declarative Base + Id type
   db/models/                 user.py (User), report.py (Case, Report; constraint names match the migrations)
   repositories/              user, case (owner-scoped get/list, generated case_number), report (one per case/session)
   schemas/                   auth, case, report (API contract, validation)
-backend/alembic/versions/    0001 reports, 0002 cases + report fields, 0003 users + case ownership (DB is at 0003)
+backend/alembic/versions/    0001 reports, 0002 cases + report fields, 0003 users + case ownership, 0004 reports.transcript (run `alembic upgrade head`)
 backend/tests/               pytest suites (see Commands)
 frontend/react-app/src/
   App.jsx                    auth gate; signed-in layout (topbar, Sidebar, CaseWorkspace keyed by case)
@@ -78,13 +80,13 @@ Frontend phases: `idle → connecting → recording → finalizing → review �
 ```bash
 cd backend && source venv/bin/activate
 python -m uvicorn app.main:app --reload       # :8000
-python -m pytest tests                        # 76 tests, no external calls (conftest: SQLite app, JWT_SECRET, BCRYPT_ROUNDS=4)
+python -m pytest tests                        # 144 tests, no external calls (conftest: SQLite app, JWT_SECRET, BCRYPT_ROUNDS=4)
 alembic upgrade head                          # reads backend/.env (DATABASE_URL)
 alembic upgrade <from>:head --sql             # review migration SQL before applying
 
 cd frontend/react-app
 npm run dev                                   # :5173
-npm test                                      # Vitest, 27 tests (test/fakes.js: FakeWebSocket, routeFetch)
+npm test                                      # Vitest, 33 tests (test/fakes.js: FakeWebSocket, routeFetch)
 npm run build
 ```
 
@@ -107,8 +109,11 @@ npm run build
 
 ## Gotchas
 
+- Logs never contain dictated or model text: log counts, codes and exception types only (validation error text quotes values; pydantic errors echo input).
+- `TURN_SILENCE_MS` default is 3000 (was 7000); not yet tuned against live audio. `evals/` only measures text extraction, not turn splitting.
 - A running `uvicorn --reload` reloads on every save mid-edit. Keep anything that touches the real DB out of import/startup paths.
-- Chunks that arrive after finalize are ignored (`awaiting_review`), so a late final turn can be dropped. Whether `transcriber.disconnect(terminate=True)` flushes the last turn before finalize is unverified against live AssemblyAI.
+- Stop order is `force_endpoint` → `disconnect(terminate=True)` → drain the worker (bounded by `STOP_DRAIN_TIMEOUT_SECONDS`) → finalize. `force_endpoint` sends a ForceEndpoint frame; that the server then returns the pending turn is unverified against live AssemblyAI.
+- Chunks that arrive after finalize are ignored (`awaiting_review`).
 - Session state lives in process memory: a server restart mid-dictation loses the draft, and it doesn't work across multiple workers.
 - Report IDs can have gaps (sequence numbers aren't reused). `case_number` is the human-facing identifier; the UI doesn't send it yet.
 - Approved reports can't be edited (no PUT): that needs audit/versioning, which is out of scope.
