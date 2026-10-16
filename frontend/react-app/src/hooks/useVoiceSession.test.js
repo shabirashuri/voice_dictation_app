@@ -94,6 +94,8 @@ describe("useVoiceSession", () => {
     fetch.mockResolvedValue(jsonResponse(201, { id: 7 }));
     const { result } = renderHook(() => useVoiceSession(OPTIONS));
     const socket = await reachReview(result);
+    act(() => socket.serverSend({ type: "turn", turn_id: 1, transcript: "Specimen is a gastric biopsy.", is_final: true }));
+    act(() => socket.serverSend({ type: "chunk_status", turn_id: 1, status: "applied" }));
 
     act(() => result.current.updateDraftField("diagnosis", "Chronic gastritis, edited."));
     act(() => result.current.acknowledgeAiComment(true));
@@ -111,6 +113,7 @@ describe("useVoiceSession", () => {
     expect(body.comment_source).toBe("ai");
     expect(body.report.diagnosis).toBe("Chronic gastritis, edited.");
     expect(body.report).not.toHaveProperty("comment_source");
+    expect(body.transcript).toEqual([{ text: "Specimen is a gastric biopsy.", status: "applied" }]);
 
     expect(result.current.phase).toBe("saved");
     expect(result.current.savedReportId).toBe(7);

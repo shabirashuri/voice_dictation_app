@@ -193,3 +193,18 @@ async def test_chit_chat_containing_no_is_not_rejected():
     res = await process_chunk("graph_ground_chitchat", "No, that's all for now.", llm=llm)
     assert "error_code" not in res
     assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("The glands show chronic inflammation", ["microscopic_description"]),
+        ("They will rename the file and denote nothing", []),
+        ("Gross: three tan-white fragments", ["gross_description"]),
+    ],
+)
+async def test_classifier_hints_match_whole_words(text, expected):
+    from app.graph.nodes.classify import classify_sections
+
+    assert await classify_sections(text) == expected

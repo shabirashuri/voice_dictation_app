@@ -63,7 +63,9 @@ async def test_extract_sends_full_context_and_validates_response(monkeypatch):
     assert result["updates"][0]["target_section"] == "microscopic_description"
     assert llm.base_url == "https://example.test"
     assert captured["temperature"] == 0.0
-    assert captured["response_format"] == {"type": "json_object"}
+    assert captured["response_format"]["type"] == "json_schema"
+    schema = captured["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["updates"]["items"]["properties"]["target_section"]["enum"][0] == "patient"
     user_message = captured["messages"][1]["content"]
     assert "CURRENT REPORT STATE" in user_message
     assert "CURRENT TRANSCRIPT CHUNK" in user_message
@@ -213,3 +215,8 @@ async def test_chat_request_preserves_http_error_details(monkeypatch):
         await llm._chat_request([])
 
 
+
+
+def test_json_object_mode_can_be_selected(monkeypatch):
+    monkeypatch.setenv("GROQ_RESPONSE_FORMAT", "json_object")
+    assert GroqLLM(api_key="k").response_format == {"type": "json_object"}

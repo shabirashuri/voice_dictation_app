@@ -3,6 +3,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -69,6 +70,9 @@ class Report(Base):
     diagnosis = Column(Text, nullable=False, server_default="")
     comments = Column(Text, nullable=False, server_default="")
     comment_source = Column(String(10), nullable=True)
+
+    # Final speech-to-text lines [{"text", "status"}], kept for accuracy review.
+    transcript = Column(JSON, nullable=True)
 
     status = Column(String(50), nullable=False, server_default="draft")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

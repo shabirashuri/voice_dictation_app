@@ -296,6 +296,7 @@ export function useVoiceSession({ caseId, token, onSaved } = {}) {
           report: draft,
           // A comment typed in review with no prior source is the clinician's.
           comment_source: draft.comments.trim() ? commentSource || "doctor" : null,
+          transcript: transcripts.map(({ text, status }) => ({ text, status })),
         },
       });
       setSavedReportId(saved?.id ?? null);
@@ -306,7 +307,7 @@ export function useVoiceSession({ caseId, token, onSaved } = {}) {
       setError({ code: "save", message: saveError.message || "Could not save the report" });
       setPhase("review");
     }
-  }, [aiCommentAcknowledged, caseId, closeSocket, commentSource, draft, onSaved, setPhase, token]);
+  }, [aiCommentAcknowledged, caseId, closeSocket, commentSource, draft, onSaved, setPhase, token, transcripts]);
 
   const discardReport = useCallback(() => {
     closeSocket();

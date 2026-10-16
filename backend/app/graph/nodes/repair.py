@@ -17,7 +17,8 @@ def repair_node(state: LangGraphState) -> dict:
 
 def reject_node(state: LangGraphState) -> dict:
     """Node: give up on this chunk. The report and `previous_chunk` are untouched."""
-    logger.warning("rejecting chunk after validation failures: %s", state.validation_errors)
+    # Error text can quote dictated values, so only the count is logged.
+    logger.warning("rejecting chunk after %d validation failure(s)", len(state.validation_errors))
     return {
         "error_code": "validation",
         "error_message": REJECT_MESSAGE,

@@ -20,6 +20,7 @@ from assemblyai.streaming.v3 import (
 from app.core.security import AuthConfigError, decode_access_token
 from app.db.session import get_session_factory
 from app.graph.routers import process_chunk, finalize
+from app.prompts.pathology_terms import PATHOLOGY_TERMS
 from app.repositories.case import get_case
 from app.graph import workflow as _workflow_mod
 from app.services.llm.provider import LLMAPIError, LLMRateLimitError, LLMTransientError
@@ -50,6 +51,9 @@ TRANSIENT_LLM_ERRORS = (LLMRateLimitError, LLMTransientError)
 # Waits before each retry of a transient LLM failure.
 # Three retries after the first attempt: four tries in total.
 RETRY_DELAYS = (1.0, 3.0, 8.0)
+# Silence before a turn ends. Long enough to keep a sentence with a mid-sentence
+# pause together, short enough that the report updates while the doctor talks.
+DEFAULT_TURN_SILENCE_MS = 3000
 # Texts of failed chunks kept per session so the clinician can retry them.
 MAX_FAILED_TURNS = 50
 
@@ -157,9 +161,9 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
     # Configure real-time parameters: PCM 16-bit, 16k sample rate, use universal model
     # Allow configurable turn silence via TURN_SILENCE_MS env var (milliseconds).
     try:
-        turn_silence_ms = int(os.environ.get("TURN_SILENCE_MS", "7000"))
+        turn_silence_ms = int(os.environ.get("TURN_SILENCE_MS", str(DEFAULT_TURN_SILENCE_MS)))
     except Exception:
-        turn_silence_ms = 7000
+        turn_silence_ms = DEFAULT_TURN_SILENCE_MS
     try:
         vad_threshold = float(os.environ.get("VAD_THRESHOLD", "0.7"))
     except Exception:
@@ -176,6 +180,7 @@ async def websocket_voice(ws: WebSocket, session_factory=Depends(get_session_fac
         min_turn_silence=turn_silence_ms,
         vad_threshold=vad_threshold,
         voice_focus=NoiseSuppressionModel.near_field,
+        keyterms_prompt=PATHOLOGY_TERMS,
     )
 
     transcriber = AsyncRealTimeTranscriber(api_key=api_key)

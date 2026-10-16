@@ -53,7 +53,10 @@ class FakeTranscriber:
     def on(self, event, handler):
         self.handlers[event] = handler
 
+    connect_params = []
+
     async def connect(self, params):
+        FakeTranscriber.connect_params.append(params)
         await self.handlers[RealTimeEvents.Begin](self, SimpleNamespace(id="ws_test"))
 
     async def stream(self, audio_bytes):
@@ -496,3 +499,26 @@ def test_server_error_is_retried(ws_client):
         ws.send_text(json.dumps({"type": "close"}))
     assert calls["n"] == 2
 
+
+
+def test_speech_to_text_is_primed_with_pathology_vocabulary(ws_client, monkeypatch):
+    from app.prompts.pathology_terms import PATHOLOGY_TERMS
+
+    monkeypatch.delenv("TURN_SILENCE_MS", raising=False)
+    FakeTranscriber.connect_params.clear()
+    client, _ = ws_client
+    token, case, _ = _doctor_with_case(client)
+    with client.websocket_connect("/ws/voice") as ws:
+        _auth(ws, token, case["id"])
+        _next(ws, "begin")
+
+    params = FakeTranscriber.connect_params[0]
+    assert params.keyterms_prompt == PATHOLOGY_TERMS
+    assert params.min_turn_silence == 3000
+
+
+def test_pathology_terms_respect_service_limits():
+    from app.prompts.pathology_terms import PATHOLOGY_TERMS
+
+    assert len(PATHOLOGY_TERMS) <= 100 and len(set(PATHOLOGY_TERMS)) == len(PATHOLOGY_TERMS)
+    assert all(0 < len(term) <= 50 for term in PATHOLOGY_TERMS)
